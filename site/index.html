@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0f">
+  <meta name="description" content="Compare a public Instagram account's followers and following lists to find non-followers, mutuals, and followers you do not follow back.">
+  <title>FollowCheck</title>
+  <link rel="stylesheet" href="./assets/styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="./" aria-label="FollowCheck home">
+      <span class="brand-mark">F</span>
+      <span>FollowCheck</span>
+    </a>
+    <button id="settings-button" class="icon-button" type="button" aria-label="Settings">⚙</button>
+  </header>
+
+  <main class="shell">
+    <section id="landing" class="hero">
+      <div class="eyebrow">Instagram relationship checker</div>
+      <h1>See who doesn’t follow you back.</h1>
+      <p class="hero-copy">Enter a <strong>public</strong> Instagram username or profile link. No Instagram password required.</p>
+
+      <form id="scan-form" class="scan-card">
+        <label for="username">Instagram username</label>
+        <div class="input-row">
+          <span class="at">@</span>
+          <input id="username" name="username" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="username" maxlength="120" required>
+        </div>
+        <button id="scan-button" class="primary-button" type="submit"><span class="button-label">Analyze account</span></button>
+        <progress id="progress-bar" max="100" value="0" hidden></progress>
+        <div id="progress-text" class="progress-text" hidden></div>
+        <div id="status" class="status" role="status" hidden></div>
+      </form>
+
+      <div class="trust-grid">
+        <div><strong>No password</strong><span>We never ask for your Instagram login.</span></div>
+        <div><strong>Public accounts</strong><span>Username-only scans use public relationship data.</span></div>
+        <div><strong>Fast cleanup</strong><span>Select accounts and step through an unfollow queue.</span></div>
+      </div>
+      <p class="fine-print">FollowCheck is not affiliated with Instagram or Meta. Public account data is requested through the configured data provider.</p>
+    </section>
+
+    <section id="results" class="results" hidden>
+      <div class="results-header">
+        <div class="profile-summary">
+          <img id="profile-avatar" class="profile-avatar" alt="">
+          <div>
+            <h1 id="profile-name"></h1>
+            <div id="profile-handle" class="muted"></div>
+          </div>
+        </div>
+        <button id="new-scan" class="secondary-button" type="button">New scan</button>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat"><span id="stat-followers">0</span><small>Followers loaded</small></div>
+        <div class="stat"><span id="stat-following">0</span><small>Following loaded</small></div>
+        <div class="stat"><span id="stat-mutuals">0</span><small>Mutuals</small></div>
+        <div class="stat accent"><span id="stat-nonfollowers">0</span><small>Don’t follow back</small></div>
+      </div>
+
+      <div id="tabs" class="tabs" role="tablist" aria-label="Relationship lists">
+        <button class="tab active" data-tab="notFollowingBack" type="button">Don’t follow back</button>
+        <button class="tab" data-tab="mutuals" type="button">Mutuals</button>
+        <button class="tab" data-tab="youDontFollowBack" type="button">You don’t follow</button>
+      </div>
+
+      <div class="toolbar">
+        <label class="search-box">
+          <span>⌕</span>
+          <input id="search" type="search" placeholder="Search username or name" autocomplete="off">
+        </label>
+        <button id="select-visible" class="secondary-button" type="button">Select visible</button>
+        <button id="export-csv" class="secondary-button" type="button">Export CSV</button>
+      </div>
+
+      <div id="account-list" class="account-list"></div>
+      <div id="empty-state" class="empty-state" hidden>No accounts match this view.</div>
+    </section>
+  </main>
+
+  <aside id="selection-bar" class="selection-bar" hidden>
+    <div><strong id="selection-count">0 selected</strong><button id="clear-selection" class="text-button" type="button">Clear</button></div>
+    <button id="start-queue" class="primary-button compact" type="button">Start unfollow queue</button>
+  </aside>
+
+  <dialog id="queue-dialog" class="dialog queue-dialog">
+    <button id="close-queue" class="dialog-close" type="button" aria-label="Close">×</button>
+    <div class="queue-kicker">Unfollow queue</div>
+    <div id="queue-counter" class="muted"></div>
+    <img id="queue-avatar" class="queue-avatar" alt="">
+    <h2 id="queue-name"></h2>
+    <div id="queue-handle" class="muted"></div>
+    <p>Open this profile in Instagram, decide whether to unfollow it there, then mark it handled and continue.</p>
+    <a id="open-instagram" class="primary-button full" target="_blank" rel="noopener noreferrer">Open in Instagram</a>
+    <button id="mark-done" class="secondary-button full" type="button">Mark handled</button>
+    <div class="queue-nav">
+      <button id="queue-prev" class="secondary-button" type="button">Back</button>
+      <button id="queue-next" class="secondary-button" type="button">Next</button>
+    </div>
+  </dialog>
+
+  <dialog id="settings-dialog" class="dialog">
+    <button class="dialog-close" data-close-dialog type="button" aria-label="Close">×</button>
+    <h2>Settings</h2>
+    <form id="settings-form">
+      <label for="access-code">Site access code <span class="muted">(if required)</span></label>
+      <input id="access-code" type="password" autocomplete="off" placeholder="Access code">
+      <p class="fine-print">The code is stored only in this browser and sent to the FollowCheck backend with scan requests.</p>
+      <button class="primary-button full" type="submit">Save</button>
+    </form>
+  </dialog>
+
+  <footer class="site-footer">
+    <a href="./privacy.html">Privacy</a>
+    <span>•</span>
+    <span>Not affiliated with Instagram or Meta.</span>
+  </footer>
+
+  <script src="./config.js"></script>
+  <script type="module" src="./assets/app.js"></script>
+</body>
+</html>
