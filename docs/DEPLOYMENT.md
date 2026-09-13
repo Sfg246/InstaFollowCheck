@@ -2,79 +2,97 @@
 
 FollowCheck has two pieces:
 
-1. `site/` — static mobile-first frontend, deployed with GitHub Pages.
-2. `worker/` — Cloudflare Worker that keeps the Instagram data-provider key private.
+1. `site/` — the static phone-first frontend on GitHub Pages.
+2. `server/` — the self-hosted Python API that maintains one dedicated Instagram collector session.
 
-## 1. Create the Instagram data API key
+## 1. Create a dedicated Instagram collector account
 
-Create an API key at `instagramapi.dev`. The worker currently uses:
+Do not use your main Instagram account. Create a normal secondary account specifically for FollowCheck. The backend only performs read operations, but Instagram can still challenge or rate-limit an automated session.
 
-- `GET /v1/profile`
-- `GET /v1/profile/followers`
-- `GET /v1/profile/following`
+If you use authenticator-app 2FA on the collector, the backend supports an optional TOTP secret through `INSTAGRAM_TOTP_SECRET`.
 
-The follower/following endpoints are paginated. FollowCheck requests every page needed for a complete comparison, so a larger account costs more provider credits.
+## 2. Configure the backend
 
-## 2. Deploy the Cloudflare Worker
-
-From the repo:
+On the server that will host FollowCheck:
 
 ```bash
-cd worker
-npm install
-npx wrangler login
-npx wrangler secret put INSTAGRAMAPI_KEY
-npx wrangler secret put ACCESS_CODE
-npm run deploy
+git clone https://github.com/Sfg246/InstaFollowCheck.git
+cd InstaFollowCheck
+cp server/.env.example server/.env
+nano server/.env
 ```
 
-`ACCESS_CODE` is optional but strongly recommended if friends will use the site, because every scan consumes third-party API credits.
+At minimum set:
 
-The deployment prints a Worker URL similar to:
+```env
+INSTAGRAM_USERNAME=your_dedicated_collector
+INSTAGRAM_PASSWORD=your_collector_password
+ALLOWED_ORIGINS=https://sfg246.github.io
+```
+
+Optionally set an `ACCESS_CODE` for friends. Do not commit `server/.env`.
+
+## 3. Start it
+
+```bash
+docker compose up -d --build
+docker compose logs -f followcheck-api
+```
+
+Check locally:
+
+```bash
+curl http://127.0.0.1:8787/health
+```
+
+A healthy response has `"ready": true`.
+
+The Docker volume persists `/data/instagram-session.json`. On later restarts the same Instagram device/session settings are loaded and validated instead of starting from a fresh identity.
+
+## 4. Give the backend HTTPS
+
+GitHub Pages is HTTPS, so browsers will block an HTTP API. Put a reverse proxy or tunnel in front of `127.0.0.1:8787`.
+
+Good options are Caddy/Nginx/Traefik with your own domain, or a Cloudflare Tunnel. The backend itself stays bound to localhost.
+
+Example final API address:
 
 ```text
-https://followcheck-api.<your-subdomain>.workers.dev
+https://followcheck-api.example.com
 ```
 
-## 3. Point the frontend at the Worker
+## 5. Point the frontend to it
 
 Edit `site/config.js`:
 
 ```js
 window.FOLLOWCHECK_CONFIG = {
-  apiBaseUrl: 'https://followcheck-api.<your-subdomain>.workers.dev',
+  apiBaseUrl: 'https://followcheck-api.example.com',
   appName: 'FollowCheck'
 };
 ```
 
-Commit and push.
+Commit and push. The existing GitHub Pages workflow republishes the site.
 
-## 4. Configure allowed origin
+## 6. First-login challenges
 
-The default `worker/wrangler.toml` allows `https://sfg246.github.io`.
+Instagram may ask you to approve the collector login in the official app or web UI. If `/health` reports a challenge:
 
-If FollowCheck is deployed under a custom domain or a different GitHub account, change `ALLOWED_ORIGINS` and redeploy the Worker.
+1. Sign into the dedicated collector account normally.
+2. Complete Instagram's verification prompt.
+3. Restart the backend with `docker compose restart followcheck-api`.
+4. Keep the server on the same stable IP and keep the persisted session volume.
 
-Multiple origins can be comma-separated.
+Do not put the backend into rapid login/retry loops.
 
-## 5. Enable GitHub Pages
+## 7. How the no-provider design protects the account
 
-In the repository:
+- One Instagram session only, serialized through a global lock.
+- `instagrapi` randomized request delay of 1–3 seconds.
+- Relationship pages request up to 200 entries at a time.
+- 10-minute response cache by default.
+- 15-minute automatic cooldown on Instagram 429 / wait responses.
+- Public targets only.
+- No automatic follow/unfollow actions.
 
-**Settings → Pages → Build and deployment → Source → GitHub Actions**
-
-The included workflow runs the comparison tests and deploys `site/`.
-
-For a repo named `InstaFollowCheck` under `Sfg246`, the default site URL will be:
-
-```text
-https://sfg246.github.io/InstaFollowCheck/
-```
-
-## 6. Cost guard
-
-`MAX_COMBINED_RELATIONSHIPS` defaults to `4000` in `worker/wrangler.toml`.
-
-The Worker first checks the public profile counts. If followers + following is above the cap, it rejects the scan before loading the relationship lists. This is a safety control because list endpoints are paginated and bill per request.
-
-Set the value higher if you intentionally want to support larger accounts, or `0` to disable the guard.
+These controls do not impose paid credits or a fixed scan quota. They exist because Instagram itself can rate-limit automated access.
