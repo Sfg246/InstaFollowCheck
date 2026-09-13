@@ -1,4 +1,10 @@
 node_modules/
-.dev.vars
-.wrangler/
 .DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+server/.env
+server/.env.*
+!server/.env.example
+server/data/
