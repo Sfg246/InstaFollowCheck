@@ -1,6 +1,6 @@
-// Replace this after deploying the Cloudflare Worker.
-// Example: https://followcheck-api.your-subdomain.workers.dev
+// Replace this after the self-hosted backend has a public HTTPS address.
+// Example: https://followcheck-api.example.com
 window.FOLLOWCHECK_CONFIG = {
-  apiBaseUrl: 'https://YOUR-WORKER.workers.dev',
+  apiBaseUrl: 'https://YOUR-WORKER.example.com',
   appName: 'FollowCheck'
 };
