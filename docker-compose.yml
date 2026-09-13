@@ -1,0 +1,15 @@
+services:
+  followcheck-api:
+    build:
+      context: ./server
+    container_name: followcheck-api
+    restart: unless-stopped
+    env_file:
+      - ./server/.env
+    volumes:
+      - followcheck-instagram-session:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  followcheck-instagram-session:
