@@ -11,7 +11,7 @@ Mobile-first web app for checking a **public Instagram account** and finding:
 - CSV export
 - Local "handled" tracking per scanned account
 
-FollowCheck never asks for an Instagram password and does **not** automate mass-unfollowing. The unfollow queue opens each selected Instagram profile so the user remains in control.
+FollowCheck never asks your friends for their Instagram password and does **not** automate mass-unfollowing. The queue opens selected Instagram profiles so the user remains in control.
 
 ## Architecture
 
@@ -22,81 +22,33 @@ Phone / browser
 GitHub Pages frontend
       |
       v
-Cloudflare Worker
+Your self-hosted FollowCheck API
       |
       v
-instagramapi.dev
+One dedicated Instagram collector session
 ```
 
-The API key lives only in the Worker secret store. The frontend never receives it.
+There is **no paid Instagram data-provider API key and no per-request credit system**. The backend uses `instagrapi` with a dedicated Instagram account, saves the authenticated session, and reuses it between restarts.
 
-## V1 stages completed
+## What changed from the first V1 backend
 
-### Stage 1 — Project setup
-- Static GitHub Pages site
-- Cloudflare Worker backend
-- GitHub Actions Pages workflow
-- Tests
+The original Cloudflare Worker + `instagramapi.dev` provider has been removed. The replacement lives in `server/` and keeps the same `/api/profile` and `/api/list` interface, so the mobile frontend and comparison engine stay simple.
 
-### Stage 2 — Instagram lookup
-- Public profile lookup
-- Followers pagination
-- Following pagination
-- Private/nonexistent account errors
-- Backend-only provider secret
-- Origin restriction and optional site access code
+## Run tests
 
-### Stage 3 — Comparison engine
-- Stable-ID comparison with username fallback
-- Duplicate removal
-- Non-followers
-- Mutuals
-- Followers not followed back
-- Search
-
-### Stage 4 — Mobile UI
-- Responsive dark UI
-- Profile summary
-- Stats
-- Tabs
-- Search
-- Lazy-loaded avatars
-- Progress feedback
-
-### Stage 5 — Selection and unfollow queue
-- Individual selection
-- Select visible
-- Clear selection
-- Open profile in Instagram
-- Previous/next queue navigation
-- Local handled state
-- CSV export
-
-### Stage 6 — Test and launch tooling
-- Node unit tests
-- GitHub Actions test gate
-- GitHub Pages deployment workflow
-- Privacy page
-- CORS
-- No-store responses
-- Scan-size cost guard
-- Deployment guide
-
-## Local test
+Frontend:
 
 ```bash
 npm test
 ```
 
-For the frontend, serve `site/` with any static server. For the backend:
+Backend:
 
 ```bash
-cd worker
-npm install
-npx wrangler dev
+cd server
+python -m pip install -r requirements.txt
+PYTHONPATH=. python -m unittest discover -s tests -v
 ```
-
-Then set `site/config.js` to the local Worker URL while developing.
 
 ## Deploy
 
@@ -104,18 +56,20 @@ See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Important limitations
 
-- Username-only mode works for **public accounts** supported by the configured provider.
-- The relationship endpoints are paginated, so larger accounts can consume significant provider credits.
-- FollowCheck does not bypass Instagram privacy settings.
-- FollowCheck does not automatically click Instagram's unfollow controls or perform mass-unfollowing.
-- Instagram/Meta and the third-party data provider can change behavior independently of this project.
+- Username-only scanning is intentionally limited to **public Instagram accounts**.
+- A dedicated Instagram collector account is required on the server. This is an Instagram login, not an API key.
+- Instagram can still throttle, challenge, or invalidate the collector session. No implementation can promise unlimited access to Instagram itself.
+- FollowCheck serializes Instagram requests, adds randomized delays, caches pages, and enters a cooldown on throttling instead of retrying aggressively.
+- FollowCheck does not bypass privacy settings and does not automate bulk unfollow actions.
+- `instagrapi` is an unofficial Instagram interface, so Instagram changes can require maintenance.
 
-## Security notes
+## Security
 
-- Do not commit `INSTAGRAMAPI_KEY` or `ACCESS_CODE`.
-- Keep an access code enabled if the public GitHub Pages link is shared widely.
-- Keep `ALLOWED_ORIGINS` restricted to your deployed site.
-- Keep a reasonable `MAX_COMBINED_RELATIONSHIPS` to prevent unexpectedly expensive scans.
+- Never commit `server/.env` or the saved Instagram session.
+- Use a **dedicated collector Instagram account**, not your main account.
+- Keep the API bound to localhost behind HTTPS/reverse proxy.
+- Keep `ALLOWED_ORIGINS` restricted to your FollowCheck site.
+- Enable `ACCESS_CODE` if you share the public site broadly.
 
 ## License
 
