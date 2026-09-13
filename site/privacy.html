@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0b0f">
+  <title>Privacy · FollowCheck</title>
+  <link rel="stylesheet" href="./assets/styles.css">
+</head>
+<body>
+  <header class="site-header"><a class="brand" href="./"><span class="brand-mark">F</span><span>FollowCheck</span></a></header>
+  <main class="shell prose">
+    <h1>Privacy</h1>
+    <p><strong>FollowCheck does not ask for or store your Instagram password.</strong></p>
+    <p>When you run a username-only scan, the Instagram username you enter is sent to the FollowCheck backend. The backend sends that username to the configured public-data provider to request the public profile, followers, and following lists needed for the comparison.</p>
+    <p>The comparison and selection interface run in your browser. FollowCheck stores only lightweight preferences on your device, such as the optional site access code and the usernames you mark as handled. These values use browser local storage.</p>
+    <p>The default backend is designed not to write follower/following results to a database and returns responses with <code>Cache-Control: no-store</code>. Your hosting provider and API provider may still process normal request metadata such as IP address and timestamps under their own policies.</p>
+    <p>FollowCheck is not affiliated with Instagram or Meta. Only use the service in ways permitted by applicable platform rules and law.</p>
+    <p><a href="./">← Back to FollowCheck</a></p>
+  </main>
+</body>
+</html>

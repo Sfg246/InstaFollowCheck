@@ -1,0 +1,14 @@
+name = "followcheck-api"
+main = "src/index.js"
+compatibility_date = "2026-09-13"
+
+[vars]
+# Replace with your deployed GitHub Pages origin after first deploy.
+# Example: https://sfg246.github.io
+ALLOWED_ORIGINS = "https://sfg246.github.io"
+# Safety/cost guard. Set 0 to disable. A scan needs both complete lists.
+MAX_COMBINED_RELATIONSHIPS = "4000"
+
+# Add secrets with:
+# npx wrangler secret put INSTAGRAMAPI_KEY
+# npx wrangler secret put ACCESS_CODE
