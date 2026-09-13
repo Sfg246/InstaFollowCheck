@@ -11,11 +11,12 @@
   <header class="site-header"><a class="brand" href="./"><span class="brand-mark">F</span><span>FollowCheck</span></a></header>
   <main class="shell prose">
     <h1>Privacy</h1>
-    <p><strong>FollowCheck does not ask for or store your Instagram password.</strong></p>
-    <p>When you run a username-only scan, the Instagram username you enter is sent to the FollowCheck backend. The backend sends that username to the configured public-data provider to request the public profile, followers, and following lists needed for the comparison.</p>
-    <p>The comparison and selection interface run in your browser. FollowCheck stores only lightweight preferences on your device, such as the optional site access code and the usernames you mark as handled. These values use browser local storage.</p>
-    <p>The default backend is designed not to write follower/following results to a database and returns responses with <code>Cache-Control: no-store</code>. Your hosting provider and API provider may still process normal request metadata such as IP address and timestamps under their own policies.</p>
-    <p>FollowCheck is not affiliated with Instagram or Meta. Only use the service in ways permitted by applicable platform rules and law.</p>
+    <p><strong>FollowCheck never asks visitors for their Instagram password.</strong></p>
+    <p>When you scan a public username, that username is sent to the FollowCheck backend. The backend uses the site owner's dedicated Instagram collector session to request the public profile, followers, and following data required for the comparison.</p>
+    <p>The collector account credentials and saved session stay on the private backend server. They are never shipped to the website or browser.</p>
+    <p>The comparison and selection interface run in your browser. FollowCheck stores lightweight preferences on your device, including the optional site access code and usernames you mark as handled.</p>
+    <p>The default backend uses short-lived in-memory caching to reduce repeated Instagram requests and does not include a follower database. Normal server/reverse-proxy logs may still contain request metadata such as IP address and timestamps.</p>
+    <p>Private Instagram targets are intentionally refused. FollowCheck is not affiliated with Instagram or Meta.</p>
     <p><a href="./">← Back to FollowCheck</a></p>
   </main>
 </body>
