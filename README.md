@@ -1,19 +1,23 @@
 # FollowCheck
 
-Mobile-first web app for checking a **public Instagram account** and finding:
+FollowCheck is a mobile-first web app for comparing a **public Instagram account's** followers and following lists.
 
-- Accounts you follow that do not follow you back
-- Mutual followers
-- Followers you do not follow back
-- Search/filter results
-- Multi-select
-- A phone-friendly manual unfollow queue
+It provides:
+
+- accounts followed by the target that do not follow back
+- mutuals
+- followers the target does not follow back
+- search/filtering
+- multi-select
+- a manual unfollow queue that opens Instagram profiles
 - CSV export
-- Local "handled" tracking per scanned account
+- local handled-state tracking
+- scan progress and live ETA
+- completeness checks that refuse partial comparisons
 
-FollowCheck never asks your friends for their Instagram password and does **not** automate mass-unfollowing. The queue opens selected Instagram profiles so the user remains in control.
+FollowCheck does not automate mass-unfollowing.
 
-## Architecture
+## V3 architecture: anonymous public web
 
 ```text
 Phone / browser
@@ -22,19 +26,47 @@ Phone / browser
 GitHub Pages frontend
       |
       v
-Your self-hosted FollowCheck API
+Self-hosted FollowCheck API
+      |
+      +--> persistent shared SQLite graph/page cache
       |
       v
-One dedicated Instagram collector session
+Instagram public-web surfaces
+(no Instagram login/session configured)
 ```
 
-There is **no paid Instagram data-provider API key and no per-request credit system**. The backend uses `instagrapi` with a dedicated Instagram account, saves the authenticated session, and reuses it between restarts.
+V3 intentionally removes the authenticated collector from the runtime path. The backend does not need an Instagram username, password, `sessionid`, TOTP secret, proxy fleet, or paid provider key.
 
-## What changed from the first V1 backend
+The public-web path is **opportunistic, not guaranteed**. Instagram can change or disable these surfaces or rate-limit anonymous access. FollowCheck treats 401/403/429 as a stop condition and never implements proxy rotation, fingerprint rotation, login-account rotation, or retry loops intended to defeat those controls.
 
-The original Cloudflare Worker + `instagramapi.dev` provider has been removed. The replacement lives in `server/` and keeps the same `/api/profile` and `/api/list` interface, so the mobile frontend and comparison engine stay simple.
+## PublicWebProbe
 
-## Run tests
+The backend contains a controlled capability probe:
+
+```http
+POST /api/probe
+{"handle":"instagram"}
+```
+
+It attempts at most:
+
+1. one public profile request
+2. the first public followers page
+3. the first public following page
+
+There are no automatic HTTP retries. If Instagram blocks or rate-limits the probe, it stops immediately and enters cooldown.
+
+## Shared cache
+
+`server/app/graph_store.py` stores recent public profile/page responses in SQLite and deduplicates relationship identities into a lightweight graph table. Repeated scans can reuse fresh cached pages instead of asking Instagram again.
+
+Default cache TTLs are one hour and are configurable in `server/.env`.
+
+## Completeness protection
+
+The frontend remembers the follower/following counts reported by the profile response. If pagination ends before the same number of unique identities has been loaded, FollowCheck returns an **incomplete snapshot** error rather than calculating a misleading result.
+
+## Tests
 
 Frontend:
 
@@ -50,26 +82,27 @@ python -m pip install -r requirements.txt
 PYTHONPATH=. python -m unittest discover -s tests -v
 ```
 
-## Deploy
+Backend tests use `httpx.MockTransport`; CI does not contact Instagram.
 
-See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+## Deployment
+
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) and [`docs/PUBLIC_WEB_PROBE.md`](docs/PUBLIC_WEB_PROBE.md).
 
 ## Important limitations
 
-- Username-only scanning is intentionally limited to **public Instagram accounts**.
-- A dedicated Instagram collector account is required on the server. This is an Instagram login, not an API key.
-- Instagram can still throttle, challenge, or invalidate the collector session. No implementation can promise unlimited access to Instagram itself.
-- FollowCheck serializes Instagram requests, adds randomized delays, caches pages, and enters a cooldown on throttling instead of retrying aggressively.
-- FollowCheck does not bypass privacy settings and does not automate bulk unfollow actions.
-- `instagrapi` is an unofficial Instagram interface, so Instagram changes can require maintenance.
+- Public accounts only.
+- Public-web follower/following pagination may be unavailable, incomplete, or changed by Instagram without notice.
+- There is no promise of unlimited Instagram-origin traffic. The cache can make repeated FollowCheck searches cheap/free from an origin-request perspective, but Instagram still controls uncached public-web access.
+- No private-account bypass exists.
+- No automated follow/unfollow endpoint exists.
 
 ## Security
 
-- Never commit `server/.env` or the saved Instagram session.
-- Use a **dedicated collector Instagram account**, not your main account.
-- Keep the API bound to localhost behind HTTPS/reverse proxy.
-- Keep `ALLOWED_ORIGINS` restricted to your FollowCheck site.
-- Enable `ACCESS_CODE` if you share the public site broadly.
+- Keep `server/.env` out of Git.
+- Use an `ACCESS_CODE` on an internet-facing instance.
+- Keep the API bound to localhost and publish it only through HTTPS.
+- Keep `ALLOWED_ORIGINS` restricted to the FollowCheck frontend.
+- Automatic FastAPI docs/OpenAPI endpoints are disabled in production code.
 
 ## License
 
