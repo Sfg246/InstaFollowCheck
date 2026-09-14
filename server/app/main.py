@@ -55,6 +55,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-FollowCheck-Code"],
+    expose_headers=["Retry-After"],
 )
 
 
@@ -68,8 +69,11 @@ class ListRequest(BaseModel):
     cursor: str | None = ""
 
 
-def error_payload(code: str, message: str) -> dict:
-    return {"error": {"code": code, "message": message}}
+def error_payload(code: str, message: str, retry_after: int | None = None) -> dict:
+    error = {"code": code, "message": message}
+    if retry_after:
+        error["retry_after_seconds"] = int(retry_after)
+    return {"error": error}
 
 
 def check_access(request: Request) -> JSONResponse | None:
@@ -92,7 +96,11 @@ def validate_handle(raw: str) -> str:
 @app.exception_handler(InstagramGatewayError)
 async def gateway_error_handler(_: Request, exc: InstagramGatewayError):
     headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else {}
-    return JSONResponse(error_payload(exc.code, str(exc)), status_code=exc.status, headers=headers)
+    return JSONResponse(
+        error_payload(exc.code, str(exc), exc.retry_after),
+        status_code=exc.status,
+        headers=headers,
+    )
 
 
 @app.get("/health")
