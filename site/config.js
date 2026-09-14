@@ -1,6 +1,4 @@
-// Replace this after the self-hosted backend has a public HTTPS address.
-// Example: https://followcheck-api.example.com
 window.FOLLOWCHECK_CONFIG = {
-  apiBaseUrl: 'https://YOUR-WORKER.example.com',
+  apiBaseUrl: 'https://andys-gameing-server.tail52ebb8.ts.net',
   appName: 'FollowCheck'
 };
