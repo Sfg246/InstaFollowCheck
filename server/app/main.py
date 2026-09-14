@@ -54,7 +54,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="FollowCheck Public-Web API",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -81,6 +81,8 @@ class ListRequest(BaseModel):
 
 class ProbeRequest(BaseModel):
     handle: str
+    profile_strategy: Literal["profile_html", "web_profile_info"] = "profile_html"
+    include_relationships: bool = True
 
 
 def error_payload(code: str, message: str, retry_after: int | None = None) -> dict[str, Any]:
@@ -160,7 +162,11 @@ async def probe(body: ProbeRequest, request: Request):
     if blocked:
         return blocked
     handle = validate_handle(body.handle)
-    return await gateway.probe(handle)
+    return await gateway.probe(
+        handle,
+        profile_strategy=body.profile_strategy,
+        include_relationships=body.include_relationships,
+    )
 
 
 @app.get("/api/cache/{handle}")

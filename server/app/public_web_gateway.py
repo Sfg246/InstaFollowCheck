@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import logging
 import os
+import re
 import time
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 from urllib.parse import quote
 
 import httpx
@@ -16,23 +18,28 @@ from .graph_store import GraphStore
 log = logging.getLogger("followcheck.public_web")
 
 ListKind = Literal["followers", "following"]
+ProfileStrategy = Literal["profile_html", "web_profile_info"]
 
-PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 GRAPHQL_URL = "https://www.instagram.com/graphql/query/"
 DEFAULT_APP_ID = "936619743392459"
 DEFAULT_FOLLOWERS_HASH = "c76146de99bb02f6415203be841dd25a"
 DEFAULT_FOLLOWING_HASH = "d04b0a864b4b54837c0d870b0e77e076"
 
+SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.IGNORECASE | re.DOTALL)
+
 
 class PublicWebGateway:
-    """Read public Instagram web surfaces without an authenticated account.
+    """Read Instagram surfaces that are reachable without authentication.
 
     Safety properties:
     - never accepts or sends an Instagram username/password/sessionid;
-    - no proxy rotation, fingerprint rotation, or anti-bot bypass logic;
+    - no proxy rotation, fingerprint rotation, account rotation, or anti-bot bypass;
     - all Instagram requests are serialized and paced;
-    - 401/403/429 stops the source and starts a cooldown;
-    - zero automatic HTTP retries.
+    - a 401/403/429 stops origin traffic and starts a cooldown;
+    - zero automatic HTTP retries;
+    - capability probes choose one profile strategy explicitly, so strategies can
+      be tested independently instead of chaining requests after a block.
     """
 
     def __init__(self) -> None:
@@ -40,6 +47,7 @@ class PublicWebGateway:
         self.min_interval = max(0.0, float(os.getenv("PUBLIC_MIN_REQUEST_INTERVAL_SECONDS", "2.0")))
         self.cooldown_seconds = max(60, int(os.getenv("PUBLIC_COOLDOWN_SECONDS", "900")))
         self.timeout_seconds = max(3.0, float(os.getenv("PUBLIC_HTTP_TIMEOUT_SECONDS", "15")))
+        self.max_html_bytes = max(64_000, int(os.getenv("PUBLIC_MAX_HTML_BYTES", "3000000")))
         self.app_id = os.getenv("PUBLIC_IG_APP_ID", DEFAULT_APP_ID).strip() or DEFAULT_APP_ID
         self.followers_hash = os.getenv("PUBLIC_FOLLOWERS_QUERY_HASH", DEFAULT_FOLLOWERS_HASH).strip()
         self.following_hash = os.getenv("PUBLIC_FOLLOWING_QUERY_HASH", DEFAULT_FOLLOWING_HASH).strip()
@@ -70,7 +78,6 @@ class PublicWebGateway:
                 "Accept": "*/*",
                 "Accept-Language": "en-US,en;q=0.9",
                 "User-Agent": self.user_agent,
-                "X-IG-App-ID": self.app_id,
             },
         )
         self.ready = True
@@ -89,61 +96,144 @@ class PublicWebGateway:
             "ready": bool(self.ready and self.client is not None and retry_after == 0),
             "mode": "public_web",
             "authenticated": False,
+            "profile_strategies": ["profile_html", "web_profile_info"],
             "cooldown_seconds": retry_after,
             "last_error": self.last_error or None,
         }
 
     async def profile(self, handle: str) -> dict[str, Any]:
+        """Resolve a public profile with cache + conservative strategy fallback.
+
+        The ordinary app path prefers the normal logged-out profile HTML. It only
+        falls back to web_profile_info when HTML returned successfully but did not
+        contain enough parseable public profile data. Access blocks never trigger
+        a second origin request.
+        """
         cached = self.store.get_profile(handle)
         if cached is not None:
             return {**cached, "cache_hit": True}
 
-        async with self.lock:
+        try:
+            return await self._profile_html(handle, use_cache=False)
+        except GatewayError as exc:
+            if exc.code != "public_profile_html_unusable":
+                raise
+
+        return await self._profile_web_info(handle, use_cache=False)
+
+    async def profile_by_strategy(
+        self,
+        handle: str,
+        strategy: ProfileStrategy,
+        *,
+        use_cache: bool = False,
+    ) -> dict[str, Any]:
+        if strategy == "profile_html":
+            return await self._profile_html(handle, use_cache=use_cache)
+        if strategy == "web_profile_info":
+            return await self._profile_web_info(handle, use_cache=use_cache)
+        raise GatewayError("invalid_probe_strategy", "Unknown profile probe strategy.", 400)
+
+    async def _profile_html(self, handle: str, *, use_cache: bool) -> dict[str, Any]:
+        if use_cache:
             cached = self.store.get_profile(handle)
             if cached is not None:
                 return {**cached, "cache_hit": True}
+
+        async with self.lock:
+            if use_cache:
+                cached = self.store.get_profile(handle)
+                if cached is not None:
+                    return {**cached, "cache_hit": True}
+
+            page_url = f"https://www.instagram.com/{quote(handle)}/"
+            text = await self._request_text(
+                page_url,
+                params={},
+                referer="https://www.instagram.com/",
+                context="profile_html",
+                accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            raw_user = self._extract_profile_from_html(text, handle)
+            if raw_user is None:
+                raise GatewayError(
+                    "public_profile_html_unusable",
+                    "Instagram returned the logged-out profile page, but it did not contain enough parseable public profile data.",
+                    503,
+                )
+
+            result = self._profile_result(raw_user, handle, source="profile_html")
+            self.store.set_profile(handle, {k: v for k, v in result.items() if k != "cache_hit"})
+            return result
+
+    async def _profile_web_info(self, handle: str, *, use_cache: bool) -> dict[str, Any]:
+        if use_cache:
+            cached = self.store.get_profile(handle)
+            if cached is not None:
+                return {**cached, "cache_hit": True}
+
+        async with self.lock:
+            if use_cache:
+                cached = self.store.get_profile(handle)
+                if cached is not None:
+                    return {**cached, "cache_hit": True}
+
             payload = await self._request_json(
-                PROFILE_URL,
+                PROFILE_INFO_URL,
                 params={"username": handle},
                 referer=f"https://www.instagram.com/{quote(handle)}/",
-                context="profile",
+                context="profile_web_info",
             )
-
             raw_user = payload.get("data", {}).get("user") if isinstance(payload, dict) else None
             if not isinstance(raw_user, dict):
                 raise GatewayError(
                     "public_profile_unavailable",
-                    "Instagram's public profile response did not contain usable profile data.",
+                    "Instagram's public profile-info response did not contain usable profile data.",
                     502,
                 )
-
-            user_id = str(raw_user.get("id") or raw_user.get("pk") or "")
-            username = str(raw_user.get("username") or handle)
-            if not user_id:
-                raise GatewayError(
-                    "public_profile_unavailable",
-                    "Instagram's public profile response did not include a user id.",
-                    502,
-                )
-
-            result = {
-                "id": user_id,
-                "username": username,
-                "full_name": str(raw_user.get("full_name") or ""),
-                "is_verified": bool(raw_user.get("is_verified")),
-                "is_private": bool(raw_user.get("is_private")),
-                "followers": self._count(raw_user, "followers"),
-                "following": self._count(raw_user, "following"),
-                "profile_pic_url": str(raw_user.get("profile_pic_url_hd") or raw_user.get("profile_pic_url") or ""),
-                "cache_hit": False,
-            }
+            result = self._profile_result(raw_user, handle, source="web_profile_info")
             self.store.set_profile(handle, {k: v for k, v in result.items() if k != "cache_hit"})
             return result
 
-    async def list_page(self, handle: str, kind: ListKind, cursor: str = "") -> dict[str, Any]:
-        cached = self.store.get_page(handle, kind, cursor)
-        if cached is not None:
-            return {**cached, "cache_hit": True}
+    def _profile_result(self, raw_user: dict[str, Any], handle: str, *, source: str) -> dict[str, Any]:
+        user_id = str(raw_user.get("id") or raw_user.get("pk") or raw_user.get("user_id") or "")
+        username = str(raw_user.get("username") or handle)
+        if not user_id:
+            raise GatewayError(
+                "public_profile_unavailable",
+                "Instagram's public profile response did not include a usable user id.",
+                502,
+            )
+        return {
+            "id": user_id,
+            "username": username,
+            "full_name": str(raw_user.get("full_name") or raw_user.get("name") or ""),
+            "is_verified": bool(raw_user.get("is_verified")),
+            "is_private": bool(raw_user.get("is_private")),
+            "followers": self._count(raw_user, "followers"),
+            "following": self._count(raw_user, "following"),
+            "profile_pic_url": str(
+                raw_user.get("profile_pic_url_hd")
+                or raw_user.get("profile_pic_url")
+                or raw_user.get("profile_image")
+                or ""
+            ),
+            "source": source,
+            "cache_hit": False,
+        }
+
+    async def list_page(
+        self,
+        handle: str,
+        kind: ListKind,
+        cursor: str = "",
+        *,
+        use_cache: bool = True,
+    ) -> dict[str, Any]:
+        if use_cache:
+            cached = self.store.get_page(handle, kind, cursor)
+            if cached is not None:
+                return {**cached, "cache_hit": True}
 
         profile = self.store.get_profile(handle)
         if profile is None:
@@ -151,9 +241,10 @@ class PublicWebGateway:
             profile = {k: v for k, v in profile_with_marker.items() if k != "cache_hit"}
 
         async with self.lock:
-            cached = self.store.get_page(handle, kind, cursor)
-            if cached is not None:
-                return {**cached, "cache_hit": True}
+            if use_cache:
+                cached = self.store.get_page(handle, kind, cursor)
+                if cached is not None:
+                    return {**cached, "cache_hit": True}
 
             if profile.get("is_private"):
                 raise GatewayError(
@@ -229,7 +320,7 @@ class PublicWebGateway:
             result = {
                 "items": items,
                 "next_cursor": next_cursor or None,
-                "source": "instagram_public_web",
+                "source": "instagram_public_web_graphql",
                 "cache_hit": False,
             }
             self.store.set_page(
@@ -242,42 +333,79 @@ class PublicWebGateway:
             )
             return result
 
-    async def probe(self, handle: str) -> dict[str, Any]:
-        """Capability probe: profile + first page of both lists, no pagination/retries."""
+    async def probe(
+        self,
+        handle: str,
+        profile_strategy: ProfileStrategy = "profile_html",
+        *,
+        include_relationships: bool = True,
+    ) -> dict[str, Any]:
+        """Probe one selected profile strategy and, if it works, first relationship pages.
+
+        No strategy fallback happens inside a probe. This is deliberate: a failure
+        of one profile surface does not cause requests to another surface, and a
+        401/403/429 never triggers additional Instagram-origin traffic.
+        """
         report: dict[str, Any] = {
             "handle": handle,
             "mode": "public_web",
             "authenticated": False,
+            "selected_profile_strategy": profile_strategy,
+            "profile_strategies": {
+                "profile_html": {"selected": profile_strategy == "profile_html", "ok": False, "status": "not_run"},
+                "web_profile_info": {
+                    "selected": profile_strategy == "web_profile_info",
+                    "ok": False,
+                    "status": "not_run",
+                },
+            },
             "profile": {"ok": False},
-            "followers": {"ok": False},
-            "following": {"ok": False},
+            "followers": {"ok": False, "status": "not_run"},
+            "following": {"ok": False, "status": "not_run"},
         }
 
         try:
-            profile = await self.profile(handle)
-            report["profile"] = {
+            profile = await self.profile_by_strategy(handle, profile_strategy, use_cache=False)
+            profile_report = {
                 "ok": True,
+                "status": 200,
+                "source": profile.get("source"),
                 "id": profile.get("id"),
                 "followers": profile.get("followers", 0),
                 "following": profile.get("following", 0),
                 "private": bool(profile.get("is_private")),
                 "cache_hit": bool(profile.get("cache_hit")),
             }
+            report["profile"] = profile_report
+            report["profile_strategies"][profile_strategy] = {
+                "selected": True,
+                **profile_report,
+            }
         except GatewayError as exc:
-            report["profile"] = self._probe_error(exc)
+            error = self._probe_error(exc)
+            report["profile"] = error
+            report["profile_strategies"][profile_strategy] = {
+                "selected": True,
+                **error,
+            }
             return report
 
-        if profile.get("is_private"):
+        if profile.get("is_private") or not include_relationships:
+            if not include_relationships:
+                report["followers"]["status"] = "skipped"
+                report["following"]["status"] = "skipped"
             return report
 
         for kind in ("followers", "following"):
             try:
-                page = await self.list_page(handle, kind, "")
+                page = await self.list_page(handle, kind, "", use_cache=False)
                 report[kind] = {
                     "ok": True,
+                    "status": 200,
                     "items": len(page.get("items") or []),
                     "has_next": bool(page.get("next_cursor")),
                     "cache_hit": bool(page.get("cache_hit")),
+                    "source": page.get("source"),
                 }
             except GatewayError as exc:
                 report[kind] = self._probe_error(exc)
@@ -296,13 +424,83 @@ class PublicWebGateway:
         referer: str,
         context: str,
     ) -> dict[str, Any]:
+        response = await self._request_response(
+            url,
+            params=params,
+            referer=referer,
+            context=context,
+            accept="application/json,text/plain,*/*",
+            include_app_id=True,
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self.last_error = f"Instagram public web returned non-JSON for {context}"
+            raise GatewayError(
+                "public_response_invalid",
+                "Instagram returned an unexpected public-web response.",
+                502,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GatewayError(
+                "public_response_invalid",
+                "Instagram returned an unexpected public-web response.",
+                502,
+            )
+        self.last_error = ""
+        return payload
+
+    async def _request_text(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        referer: str,
+        context: str,
+        accept: str,
+    ) -> str:
+        response = await self._request_response(
+            url,
+            params=params,
+            referer=referer,
+            context=context,
+            accept=accept,
+            include_app_id=False,
+        )
+        raw = response.content
+        if len(raw) > self.max_html_bytes:
+            raise GatewayError(
+                "public_profile_html_too_large",
+                "Instagram's public profile page exceeded FollowCheck's diagnostic size limit.",
+                502,
+            )
+        self.last_error = ""
+        return response.text
+
+    async def _request_response(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        referer: str,
+        context: str,
+        accept: str,
+        include_app_id: bool,
+    ) -> httpx.Response:
         self._ensure_available()
         assert self.client is not None
         self._assert_anonymous_session()
         await self._pace()
 
         try:
-            response = await self.client.get(url, params=params, headers={"Referer": referer})
+            request_headers = {"Referer": referer, "Accept": accept}
+            if include_app_id:
+                request_headers["X-IG-App-ID"] = self.app_id
+            response = await self.client.get(
+                url,
+                params=params,
+                headers=request_headers,
+            )
         except httpx.TimeoutException as exc:
             self.last_error = f"public web {context} request timed out"
             raise GatewayError(
@@ -321,7 +519,7 @@ class PublicWebGateway:
             self.last_request_at = time.monotonic()
 
         if response.status_code == 404:
-            if context == "profile":
+            if context.startswith("profile"):
                 raise GatewayError("user_not_found", "Instagram account not found.", 404)
             raise GatewayError(
                 "public_relationship_unavailable",
@@ -332,7 +530,7 @@ class PublicWebGateway:
         if response.status_code in (401, 403, 429):
             retry_after = self._retry_after(response)
             self.blocked_until = max(self.blocked_until, time.time() + retry_after)
-            self.last_error = f"Instagram public web returned HTTP {response.status_code}"
+            self.last_error = f"Instagram public web returned HTTP {response.status_code} during {context}"
             code = "instagram_rate_limited" if response.status_code == 429 else "public_access_blocked"
             message = (
                 "Instagram rate-limited anonymous public-web requests. FollowCheck stopped and entered cooldown."
@@ -340,6 +538,16 @@ class PublicWebGateway:
                 else "Instagram blocked anonymous access to this public-web request. FollowCheck stopped without retrying."
             )
             raise GatewayError(code, message, response.status_code, retry_after)
+
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("Location", "")
+            self.last_error = f"Instagram public web redirected {context}"
+            raise GatewayError(
+                "public_redirect",
+                f"Instagram redirected the anonymous {context} request instead of returning the requested public data."
+                + (f" Destination: {location[:160]}" if location else ""),
+                503,
+            )
 
         if response.status_code >= 500:
             self.last_error = f"Instagram public web returned HTTP {response.status_code}"
@@ -356,25 +564,7 @@ class PublicWebGateway:
                 "Instagram did not accept this anonymous public-web request.",
                 503,
             )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            self.last_error = f"Instagram public web returned non-JSON for {context}"
-            raise GatewayError(
-                "public_response_invalid",
-                "Instagram returned an unexpected public-web response.",
-                502,
-            ) from exc
-
-        if not isinstance(payload, dict):
-            raise GatewayError(
-                "public_response_invalid",
-                "Instagram returned an unexpected public-web response.",
-                502,
-            )
-        self.last_error = ""
-        return payload
+        return response
 
     def _assert_anonymous_session(self) -> None:
         if self.client is None:
@@ -420,6 +610,183 @@ class PublicWebGateway:
         except (TypeError, ValueError):
             header_seconds = 0
         return max(self.cooldown_seconds, header_seconds, 60)
+
+    def _extract_profile_from_html(self, text: str, handle: str) -> dict[str, Any] | None:
+        """Extract a matching user object from public HTML/embedded JSON.
+
+        Instagram changes the envelope around its server-rendered data frequently,
+        so this searches JSON script payloads recursively rather than depending on
+        one JavaScript variable name. A raw-text fallback requires an exact
+        username plus a nearby numeric id.
+        """
+        target = handle.lower()
+        best: tuple[int, dict[str, Any]] | None = None
+
+        for document in self._json_documents_from_html(text):
+            for node in self._walk_json(document):
+                if not isinstance(node, dict):
+                    continue
+                username = str(node.get("username") or "").strip()
+                if username.lower() != target:
+                    continue
+                score = self._profile_candidate_score(node)
+                if score <= 0:
+                    continue
+                if best is None or score > best[0]:
+                    best = (score, node)
+
+        if best is not None:
+            candidate = dict(best[1])
+            if candidate.get("id") or candidate.get("pk") or candidate.get("user_id"):
+                return candidate
+
+        return self._extract_profile_regex(text, handle)
+
+    @staticmethod
+    def _profile_candidate_score(node: dict[str, Any]) -> int:
+        score = 0
+        if node.get("id") or node.get("pk") or node.get("user_id"):
+            score += 8
+        if "is_private" in node:
+            score += 2
+        if "full_name" in node or "name" in node:
+            score += 1
+        if "profile_pic_url" in node or "profile_pic_url_hd" in node or "profile_image" in node:
+            score += 1
+        if "follower_count" in node or isinstance(node.get("edge_followed_by"), dict):
+            score += 3
+        if "following_count" in node or isinstance(node.get("edge_follow"), dict):
+            score += 3
+        return score
+
+    def _json_documents_from_html(self, text: str) -> Iterable[Any]:
+        for match in SCRIPT_RE.finditer(text):
+            content = html_lib.unescape(match.group(1)).strip()
+            if not content:
+                continue
+
+            candidates = [content]
+            if content.startswith("for (;;);"):
+                candidates.append(content[len("for (;;);"):].lstrip())
+            if content.startswith("<!--") and content.endswith("-->"):
+                candidates.append(content[4:-3].strip())
+
+            for marker in ("window._sharedData", "__additionalDataLoaded"):
+                marker_at = content.find(marker)
+                if marker_at >= 0:
+                    brace_at = content.find("{", marker_at)
+                    if brace_at >= 0:
+                        obj = self._balanced_json_object(content, brace_at)
+                        if obj:
+                            candidates.append(obj)
+
+            for candidate in candidates:
+                try:
+                    yield json.loads(candidate)
+                    break
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+    def _walk_json(self, value: Any) -> Iterable[Any]:
+        stack = [value]
+        parsed_strings = 0
+        while stack:
+            current = stack.pop()
+            yield current
+            if isinstance(current, dict):
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+            elif (
+                isinstance(current, str)
+                and parsed_strings < 50
+                and 2 <= len(current) <= 500_000
+                and current.lstrip().startswith(("{", "["))
+            ):
+                try:
+                    nested = json.loads(current)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                parsed_strings += 1
+                stack.append(nested)
+
+    @staticmethod
+    def _balanced_json_object(text: str, start: int) -> str | None:
+        if start < 0 or start >= len(text) or text[start] != "{":
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:index + 1]
+        return None
+
+    def _extract_profile_regex(self, text: str, handle: str) -> dict[str, Any] | None:
+        escaped_handle = re.escape(handle)
+        patterns = (
+            re.compile(
+                rf'"username"\s*:\s*"{escaped_handle}"(?P<tail>.{{0,3500}}?)'
+                rf'"(?:id|pk|user_id)"\s*:\s*"?(?P<id>\d{{3,}})"?',
+                re.IGNORECASE | re.DOTALL,
+            ),
+            re.compile(
+                rf'"(?:id|pk|user_id)"\s*:\s*"?(?P<id>\d{{3,}})"?(?P<tail>.{{0,3500}}?)'
+                rf'"username"\s*:\s*"{escaped_handle}"',
+                re.IGNORECASE | re.DOTALL,
+            ),
+        )
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            window_start = max(0, match.start() - 3500)
+            window_end = min(len(text), match.end() + 3500)
+            window = text[window_start:window_end]
+            result: dict[str, Any] = {"id": match.group("id"), "username": handle}
+
+            private = re.search(r'"is_private"\s*:\s*(true|false)', window, re.IGNORECASE)
+            verified = re.search(r'"is_verified"\s*:\s*(true|false)', window, re.IGNORECASE)
+            full_name = re.search(r'"full_name"\s*:\s*"((?:\\.|[^"\\])*)"', window)
+            followers = re.search(r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)', window)
+            following = re.search(r'"edge_follow"\s*:\s*\{\s*"count"\s*:\s*(\d+)', window)
+            follower_direct = re.search(r'"follower_count"\s*:\s*(\d+)', window)
+            following_direct = re.search(r'"following_count"\s*:\s*(\d+)', window)
+
+            if private:
+                result["is_private"] = private.group(1).lower() == "true"
+            if verified:
+                result["is_verified"] = verified.group(1).lower() == "true"
+            if full_name:
+                try:
+                    result["full_name"] = json.loads(f'"{full_name.group(1)}"')
+                except json.JSONDecodeError:
+                    result["full_name"] = full_name.group(1)
+            if followers:
+                result["edge_followed_by"] = {"count": int(followers.group(1))}
+            elif follower_direct:
+                result["follower_count"] = int(follower_direct.group(1))
+            if following:
+                result["edge_follow"] = {"count": int(following.group(1))}
+            elif following_direct:
+                result["following_count"] = int(following_direct.group(1))
+            return result
+        return None
 
     @staticmethod
     def _count(user: dict[str, Any], kind: ListKind) -> int:

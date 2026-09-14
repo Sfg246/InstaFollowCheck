@@ -1,68 +1,84 @@
-# FollowCheck v3 backend
+# FollowCheck self-hosted backend
 
-The v3 backend uses an **anonymous public-web data source** plus a persistent shared SQLite cache. It does not require an Instagram account or a paid data-provider key.
+FollowCheck V3.1 is a username-only public-account experiment that uses Instagram's **logged-out public web surfaces**. It does not use an Instagram collector account, visitor Instagram credentials, a `sessionid`, a paid provider, or an API key.
 
-## Runtime endpoints
+## Architecture
 
-- `GET /health` — public service/data-source health
-- `POST /api/profile` — public profile lookup
-- `POST /api/list` — one followers/following page
-- `POST /api/probe` — controlled profile + first-page capability test
-- `GET /api/cache/{handle}` — cache/snapshot diagnostics
+```text
+GitHub Pages
+    |
+    v
+FollowCheck FastAPI backend
+    |
+    +--> shared SQLite cache
+    |
+    +--> Instagram logged-out public web
+```
 
-All `/api/*` endpoints are protected by `ACCESS_CODE` when one is configured. `/health` remains unauthenticated so the frontend can display cooldown state.
+The frontend keeps the existing `/api/profile` and `/api/list` contract.
 
-## Safety behavior
+## Profile discovery
 
-The public-web gateway deliberately has conservative behavior:
+V3.1 has two anonymous profile strategies:
 
-- no Instagram credentials or authenticated session
-- no automatic HTTP retries
-- serialized Instagram-origin requests
-- fixed minimum interval between origin requests
-- 401/403/429 immediately stop new origin requests and start cooldown
-- no proxy rotation or anti-bot bypass logic
-- public targets only
-- no follow/unfollow actions
+- `profile_html` — normal logged-out profile HTML + embedded public data parser
+- `web_profile_info` — Instagram public profile-info JSON surface
 
-## Shared cache
+The normal app path prefers `profile_html`. It only falls back to `web_profile_info` after a successful HTML response that contained no usable profile data. It does not fall back after `401`, `403`, or `429`.
 
-`GraphStore` persists to `/data/followcheck.db` by default. Profiles and relationship pages use independent TTLs. Relationship identities are also deduplicated into graph tables for diagnostics and future cache/history work.
+`/api/probe` lets the two strategies be tested independently.
 
 ## Run with Docker
 
 ```bash
 cp server/.env.example server/.env
-# set ACCESS_CODE before exposing the service publicly
-
 docker compose up -d --build
 curl http://127.0.0.1:8787/health
 ```
 
-A healthy idle service reports roughly:
+A healthy response includes:
 
 ```json
 {
-  "ok": true,
-  "service": "followcheck-public-web",
-  "ready": true,
   "mode": "public_web",
-  "authenticated": false,
-  "cooldown_seconds": 0,
-  "last_error": null
+  "authenticated": false
 }
 ```
 
-## Probe before enabling normal scans
+No Instagram username/password/session file is required.
 
-Use one small public account and the access code:
+## Probe one public strategy
 
-```bash
-curl -sS \
-  -H 'Content-Type: application/json' \
-  -H 'X-FollowCheck-Code: YOUR_CODE' \
-  -d '{"handle":"instagram"}' \
-  http://127.0.0.1:8787/api/probe
+If `ACCESS_CODE` is enabled, enter it privately in your terminal and send it as the header. Example request body:
+
+```json
+{
+  "handle": "example",
+  "profile_strategy": "profile_html",
+  "include_relationships": true
+}
 ```
 
-Do not repeatedly probe after a 401, 403, or 429. The backend will expose the remaining cooldown through `/health`.
+A cold relationship probe makes at most one profile request plus one first-page request for followers and one for following. `401`, `403`, or `429` stops the probe immediately.
+
+See `docs/PUBLIC_WEB_PROBE.md` for the response format and safety rules.
+
+## Cache
+
+The Docker volume stores `/data/followcheck.db`. Successful public profiles/pages are shared across visitors for the configured TTL.
+
+The cache stores public relationship data already returned to FollowCheck. It does not contain visitor Instagram credentials.
+
+## Safety behavior
+
+- Public targets only.
+- No login or authenticated Instagram cookie.
+- No proxy/account/device/fingerprint rotation.
+- No challenge solving.
+- No automatic HTTP retry.
+- Requests are serialized and paced.
+- `401`, `403`, and `429` trigger a cooldown.
+- No automatic follow/unfollow endpoint exists.
+- HTML parsing has a configurable response-size ceiling.
+
+Instagram can change or remove public surfaces at any time. This project cannot promise unlimited access to Instagram itself.
