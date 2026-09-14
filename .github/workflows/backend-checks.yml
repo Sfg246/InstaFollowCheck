@@ -34,6 +34,7 @@ jobs:
       - name: Run backend unit tests
         env:
           PYTHONPATH: server
+          GRAPH_DB_PATH: /tmp/followcheck-ci.db
         run: python -m unittest discover -s server/tests -v
       - name: Build backend container
         run: docker build -t followcheck-backend:test ./server
