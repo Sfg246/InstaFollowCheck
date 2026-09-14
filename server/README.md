@@ -1,34 +1,68 @@
-# FollowCheck self-hosted backend
+# FollowCheck v3 backend
 
-This backend replaces the paid Instagram-data provider. It uses one dedicated Instagram collector account through `instagrapi`, stores and reuses the session, and exposes the same `/api/profile` and `/api/list` contract the phone UI already uses.
+The v3 backend uses an **anonymous public-web data source** plus a persistent shared SQLite cache. It does not require an Instagram account or a paid data-provider key.
 
-## Why a collector account is still required
+## Runtime endpoints
 
-Instagram does not provide the complete follower/following username lists through its supported public API. The self-hosted option therefore needs an authenticated Instagram session. Use a dedicated account, not your personal account.
+- `GET /health` — public service/data-source health
+- `POST /api/profile` — public profile lookup
+- `POST /api/list` — one followers/following page
+- `POST /api/probe` — controlled profile + first-page capability test
+- `GET /api/cache/{handle}` — cache/snapshot diagnostics
+
+All `/api/*` endpoints are protected by `ACCESS_CODE` when one is configured. `/health` remains unauthenticated so the frontend can display cooldown state.
+
+## Safety behavior
+
+The public-web gateway deliberately has conservative behavior:
+
+- no Instagram credentials or authenticated session
+- no automatic HTTP retries
+- serialized Instagram-origin requests
+- fixed minimum interval between origin requests
+- 401/403/429 immediately stop new origin requests and start cooldown
+- no proxy rotation or anti-bot bypass logic
+- public targets only
+- no follow/unfollow actions
+
+## Shared cache
+
+`GraphStore` persists to `/data/followcheck.db` by default. Profiles and relationship pages use independent TTLs. Relationship identities are also deduplicated into graph tables for diagnostics and future cache/history work.
 
 ## Run with Docker
 
 ```bash
 cp server/.env.example server/.env
-# edit server/.env with the dedicated collector account credentials
+# set ACCESS_CODE before exposing the service publicly
+
 docker compose up -d --build
 curl http://127.0.0.1:8787/health
 ```
 
-The session is persisted in the Docker volume. `instagrapi` loads it on restart and validates/reuses it instead of doing a fresh login each time.
+A healthy idle service reports roughly:
 
-## Public HTTPS
+```json
+{
+  "ok": true,
+  "service": "followcheck-public-web",
+  "ready": true,
+  "mode": "public_web",
+  "authenticated": false,
+  "cooldown_seconds": 0,
+  "last_error": null
+}
+```
 
-The GitHub Pages frontend is HTTPS, so the backend must also be reachable over HTTPS. Put Caddy, Nginx, Traefik, or a Cloudflare Tunnel in front of `127.0.0.1:8787`, then set `site/config.js` to that HTTPS URL.
+## Probe before enabling normal scans
 
-## Safety behavior
+Use one small public account and the access code:
 
-- Public accounts only. Private targets are refused even if the collector could view them.
-- No mass-unfollow API is implemented. The frontend only opens profiles for the user to act on manually.
-- Instagram calls are serialized through one session.
-- The client uses 1–3 second randomized delays.
-- Successful pages are cached for 10 minutes by default.
-- On Instagram 429/temporary-wait responses, the backend enters a cooldown instead of hammering retries.
-- An optional `ACCESS_CODE` can keep random visitors from using your collector.
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -H 'X-FollowCheck-Code: YOUR_CODE' \
+  -d '{"handle":"instagram"}' \
+  http://127.0.0.1:8787/api/probe
+```
 
-There is no third-party API key and no per-scan credit bill. Instagram itself can still rate-limit, challenge, or invalidate the collector session.
+Do not repeatedly probe after a 401, 403, or 429. The backend will expose the remaining cooldown through `/health`.

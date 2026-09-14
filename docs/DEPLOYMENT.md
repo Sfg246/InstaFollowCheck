@@ -1,19 +1,13 @@
-# FollowCheck deployment
+# FollowCheck v3 deployment
 
 FollowCheck has two pieces:
 
-1. `site/` — the static phone-first frontend on GitHub Pages.
-2. `server/` — the self-hosted Python API that maintains one dedicated Instagram collector session.
+1. `site/` — static phone-first frontend deployed by GitHub Pages.
+2. `server/` — self-hosted FastAPI service using anonymous Instagram public-web requests and a shared SQLite cache.
 
-## 1. Create a dedicated Instagram collector account
+There is no collector-account login step in v3.
 
-Do not use your main Instagram account. Create a normal secondary account specifically for FollowCheck. The backend only performs read operations, but Instagram can still challenge or rate-limit an automated session.
-
-If you use authenticator-app 2FA on the collector, the backend supports an optional TOTP secret through `INSTAGRAM_TOTP_SECRET`.
-
-## 2. Configure the backend
-
-On the server that will host FollowCheck:
+## 1. Configure the backend
 
 ```bash
 git clone https://github.com/Sfg246/InstaFollowCheck.git
@@ -22,77 +16,84 @@ cp server/.env.example server/.env
 nano server/.env
 ```
 
-At minimum set:
+At minimum verify:
 
 ```env
-INSTAGRAM_USERNAME=your_dedicated_collector
-INSTAGRAM_PASSWORD=your_collector_password
 ALLOWED_ORIGINS=https://sfg246.github.io
+ACCESS_CODE=choose-a-private-site-code
 ```
 
-Optionally set an `ACCESS_CODE` for friends. Do not commit `server/.env`.
+Do not put any Instagram password or `sessionid` in v3 configuration.
 
-## 3. Start it
+## 2. Start it locally only
 
 ```bash
 docker compose up -d --build
-docker compose logs -f followcheck-api
+docker compose logs --tail=100 followcheck-api
+curl -sS http://127.0.0.1:8787/health
 ```
 
-Check locally:
+The API remains bound to `127.0.0.1:8787`. The Docker volume persists `/data/followcheck.db`.
+
+## 3. Run the controlled public-web probe
+
+Before exposing the frontend, test exactly one small public username:
 
 ```bash
-curl http://127.0.0.1:8787/health
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -H 'X-FollowCheck-Code: YOUR_CODE' \
+  -d '{"handle":"instagram"}' \
+  http://127.0.0.1:8787/api/probe
 ```
 
-A healthy response has `"ready": true`.
+Interpretation:
 
-The Docker volume persists `/data/instagram-session.json`. On later restarts the same Instagram device/session settings are loaded and validated instead of starting from a fresh identity.
+- `profile.ok=true` — anonymous public profile lookup worked.
+- `followers.ok=true` — first anonymous followers page worked.
+- `following.ok=true` — first anonymous following page worked.
+- 401/403/429 — stop. Do not retry repeatedly. Check `/health` for cooldown.
 
-## 4. Give the backend HTTPS
+The probe never paginates and never retries automatically.
 
-GitHub Pages is HTTPS, so browsers will block an HTTP API. Put a reverse proxy or tunnel in front of `127.0.0.1:8787`.
+## 4. HTTPS
 
-Good options are Caddy/Nginx/Traefik with your own domain, or a Cloudflare Tunnel. The backend itself stays bound to localhost.
+GitHub Pages is HTTPS, so the API must also be HTTPS. Keep the service on localhost and publish it through a reverse proxy or tunnel.
 
-Example final API address:
+Example:
 
 ```text
 https://followcheck-api.example.com
 ```
 
-## 5. Point the frontend to it
+Then update `site/config.js`.
 
-Edit `site/config.js`:
+## 5. Cache behavior
 
-```js
-window.FOLLOWCHECK_CONFIG = {
-  apiBaseUrl: 'https://followcheck-api.example.com',
-  appName: 'FollowCheck'
-};
+Fresh cached pages are reused across visitors. Default settings:
+
+```env
+PROFILE_CACHE_TTL_SECONDS=3600
+RELATIONSHIP_CACHE_TTL_SECONDS=3600
+PUBLIC_PAGE_SIZE=25
+PUBLIC_MIN_REQUEST_INTERVAL_SECONDS=2.0
+PUBLIC_COOLDOWN_SECONDS=900
 ```
 
-Commit and push. The existing GitHub Pages workflow republishes the site.
+These are conservative service settings, not a mechanism for bypassing Instagram restrictions.
 
-## 6. First-login challenges
+## 6. Public exposure checklist
 
-Instagram may ask you to approve the collector login in the official app or web UI. If `/health` reports a challenge:
+Before turning the public tunnel back on:
 
-1. Sign into the dedicated collector account normally.
-2. Complete Instagram's verification prompt.
-3. Restart the backend with `docker compose restart followcheck-api`.
-4. Keep the server on the same stable IP and keep the persisted session volume.
+- backend tests pass
+- `ACCESS_CODE` is set
+- `/health` reports `mode=public_web` and `authenticated=false`
+- no `INSTAGRAM_*` credentials are required by the running container
+- one controlled `/api/probe` succeeds or returns a clean unsupported/block result
+- FastAPI `/docs`, `/redoc`, and `/openapi.json` return 404
+- frontend points to the HTTPS API URL
 
-Do not put the backend into rapid login/retry loops.
+## 7. Rollback
 
-## 7. How the no-provider design protects the account
-
-- One Instagram session only, serialized through a global lock.
-- `instagrapi` randomized request delay of 1–3 seconds.
-- Relationship pages request up to 200 entries at a time.
-- 10-minute response cache by default.
-- 15-minute automatic cooldown on Instagram 429 / wait responses.
-- Public targets only.
-- No automatic follow/unfollow actions.
-
-These controls do not impose paid credits or a fixed scan quota. They exist because Instagram itself can rate-limit automated access.
+If Instagram public-web relationship pagination is unavailable, stop the public API/tunnel. Do not switch back to the previous authenticated collector automatically. V3 is designed to fail closed rather than risk another Instagram account.

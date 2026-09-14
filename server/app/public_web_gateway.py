@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from typing import Any, Literal
+from urllib.parse import quote
+
+import httpx
+
+from .errors import GatewayError
+from .graph_store import GraphStore
+
+log = logging.getLogger("followcheck.public_web")
+
+ListKind = Literal["followers", "following"]
+
+PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+GRAPHQL_URL = "https://www.instagram.com/graphql/query/"
+DEFAULT_APP_ID = "936619743392459"
+DEFAULT_FOLLOWERS_HASH = "c76146de99bb02f6415203be841dd25a"
+DEFAULT_FOLLOWING_HASH = "d04b0a864b4b54837c0d870b0e77e076"
+
+
+class PublicWebGateway:
+    """Read public Instagram web surfaces without an authenticated account.
+
+    Safety properties:
+    - never accepts or sends an Instagram username/password/sessionid;
+    - no proxy rotation, fingerprint rotation, or anti-bot bypass logic;
+    - all Instagram requests are serialized and paced;
+    - 401/403/429 stops the source and starts a cooldown;
+    - zero automatic HTTP retries.
+    """
+
+    def __init__(self) -> None:
+        self.page_size = max(1, min(int(os.getenv("PUBLIC_PAGE_SIZE", "25")), 50))
+        self.min_interval = max(0.0, float(os.getenv("PUBLIC_MIN_REQUEST_INTERVAL_SECONDS", "2.0")))
+        self.cooldown_seconds = max(60, int(os.getenv("PUBLIC_COOLDOWN_SECONDS", "900")))
+        self.timeout_seconds = max(3.0, float(os.getenv("PUBLIC_HTTP_TIMEOUT_SECONDS", "15")))
+        self.app_id = os.getenv("PUBLIC_IG_APP_ID", DEFAULT_APP_ID).strip() or DEFAULT_APP_ID
+        self.followers_hash = os.getenv("PUBLIC_FOLLOWERS_QUERY_HASH", DEFAULT_FOLLOWERS_HASH).strip()
+        self.following_hash = os.getenv("PUBLIC_FOLLOWING_QUERY_HASH", DEFAULT_FOLLOWING_HASH).strip()
+        self.user_agent = os.getenv(
+            "PUBLIC_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        ).strip()
+        self.store = GraphStore(
+            os.getenv("GRAPH_DB_PATH", "/data/followcheck.db"),
+            profile_ttl=int(os.getenv("PROFILE_CACHE_TTL_SECONDS", "3600")),
+            page_ttl=int(os.getenv("RELATIONSHIP_CACHE_TTL_SECONDS", "3600")),
+        )
+        self.lock = asyncio.Lock()
+        self.client: httpx.AsyncClient | None = None
+        self.ready = False
+        self.blocked_until = 0.0
+        self.last_request_at = 0.0
+        self.last_error = "not initialized"
+
+    async def start(self) -> None:
+        if self.client is not None:
+            return
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout_seconds),
+            follow_redirects=False,
+            headers={
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": self.user_agent,
+                "X-IG-App-ID": self.app_id,
+            },
+        )
+        self.ready = True
+        self.last_error = ""
+        log.info("Public web gateway ready (anonymous; no Instagram account/session configured)")
+
+    async def close(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+        self.client = None
+        self.ready = False
+
+    def health(self) -> dict[str, Any]:
+        retry_after = max(0, int(self.blocked_until - time.time()))
+        return {
+            "ready": bool(self.ready and self.client is not None and retry_after == 0),
+            "mode": "public_web",
+            "authenticated": False,
+            "cooldown_seconds": retry_after,
+            "last_error": self.last_error or None,
+        }
+
+    async def profile(self, handle: str) -> dict[str, Any]:
+        cached = self.store.get_profile(handle)
+        if cached is not None:
+            return {**cached, "cache_hit": True}
+
+        async with self.lock:
+            cached = self.store.get_profile(handle)
+            if cached is not None:
+                return {**cached, "cache_hit": True}
+            payload = await self._request_json(
+                PROFILE_URL,
+                params={"username": handle},
+                referer=f"https://www.instagram.com/{quote(handle)}/",
+                context="profile",
+            )
+
+            raw_user = payload.get("data", {}).get("user") if isinstance(payload, dict) else None
+            if not isinstance(raw_user, dict):
+                raise GatewayError(
+                    "public_profile_unavailable",
+                    "Instagram's public profile response did not contain usable profile data.",
+                    502,
+                )
+
+            user_id = str(raw_user.get("id") or raw_user.get("pk") or "")
+            username = str(raw_user.get("username") or handle)
+            if not user_id:
+                raise GatewayError(
+                    "public_profile_unavailable",
+                    "Instagram's public profile response did not include a user id.",
+                    502,
+                )
+
+            result = {
+                "id": user_id,
+                "username": username,
+                "full_name": str(raw_user.get("full_name") or ""),
+                "is_verified": bool(raw_user.get("is_verified")),
+                "is_private": bool(raw_user.get("is_private")),
+                "followers": self._count(raw_user, "followers"),
+                "following": self._count(raw_user, "following"),
+                "profile_pic_url": str(raw_user.get("profile_pic_url_hd") or raw_user.get("profile_pic_url") or ""),
+                "cache_hit": False,
+            }
+            self.store.set_profile(handle, {k: v for k, v in result.items() if k != "cache_hit"})
+            return result
+
+    async def list_page(self, handle: str, kind: ListKind, cursor: str = "") -> dict[str, Any]:
+        cached = self.store.get_page(handle, kind, cursor)
+        if cached is not None:
+            return {**cached, "cache_hit": True}
+
+        profile = self.store.get_profile(handle)
+        if profile is None:
+            profile_with_marker = await self.profile(handle)
+            profile = {k: v for k, v in profile_with_marker.items() if k != "cache_hit"}
+
+        async with self.lock:
+            cached = self.store.get_page(handle, kind, cursor)
+            if cached is not None:
+                return {**cached, "cache_hit": True}
+
+            if profile.get("is_private"):
+                raise GatewayError(
+                    "private_account",
+                    "Username-only scanning only works for public Instagram accounts.",
+                    403,
+                )
+
+            user_id = str(profile.get("id") or "")
+            if not user_id:
+                raise GatewayError("user_not_found", "Instagram account not found.", 404)
+
+            variables: dict[str, Any] = {
+                "id": user_id,
+                "include_reel": True,
+                "fetch_mutual": kind == "followers",
+                "first": self.page_size,
+            }
+            if cursor:
+                variables["after"] = cursor
+
+            query_hash = self.followers_hash if kind == "followers" else self.following_hash
+            if not query_hash:
+                raise GatewayError(
+                    "public_relationship_unavailable",
+                    "No public relationship query is configured for this FollowCheck build.",
+                    503,
+                )
+
+            payload = await self._request_json(
+                GRAPHQL_URL,
+                params={
+                    "query_hash": query_hash,
+                    "variables": json.dumps(variables, separators=(",", ":")),
+                },
+                referer=f"https://www.instagram.com/{quote(handle)}/",
+                context=kind,
+            )
+
+            edge_name = "edge_followed_by" if kind == "followers" else "edge_follow"
+            user = payload.get("data", {}).get("user") if isinstance(payload, dict) else None
+            edge = user.get(edge_name) if isinstance(user, dict) else None
+            if not isinstance(edge, dict):
+                raise GatewayError(
+                    "public_relationship_unavailable",
+                    "Instagram did not expose that relationship page through its anonymous public web response.",
+                    503,
+                )
+
+            raw_edges = edge.get("edges")
+            if not isinstance(raw_edges, list):
+                raw_edges = []
+            items = []
+            for raw_edge in raw_edges:
+                node = raw_edge.get("node") if isinstance(raw_edge, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                cleaned = self._clean_node(node)
+                if cleaned["username"]:
+                    items.append(cleaned)
+
+            page_info = edge.get("page_info") if isinstance(edge.get("page_info"), dict) else {}
+            has_next = bool(page_info.get("has_next_page"))
+            next_cursor = str(page_info.get("end_cursor") or "") if has_next else ""
+            if has_next and not next_cursor:
+                raise GatewayError(
+                    "public_pagination_invalid",
+                    "Instagram indicated another page exists but did not return a usable cursor.",
+                    502,
+                )
+
+            expected_count = int(profile.get("followers" if kind == "followers" else "following") or 0)
+            result = {
+                "items": items,
+                "next_cursor": next_cursor or None,
+                "source": "instagram_public_web",
+                "cache_hit": False,
+            }
+            self.store.set_page(
+                handle=handle,
+                subject_id=user_id,
+                kind=kind,
+                cursor=cursor,
+                payload={k: v for k, v in result.items() if k != "cache_hit"},
+                expected_count=expected_count,
+            )
+            return result
+
+    async def probe(self, handle: str) -> dict[str, Any]:
+        """Capability probe: profile + first page of both lists, no pagination/retries."""
+        report: dict[str, Any] = {
+            "handle": handle,
+            "mode": "public_web",
+            "authenticated": False,
+            "profile": {"ok": False},
+            "followers": {"ok": False},
+            "following": {"ok": False},
+        }
+
+        try:
+            profile = await self.profile(handle)
+            report["profile"] = {
+                "ok": True,
+                "id": profile.get("id"),
+                "followers": profile.get("followers", 0),
+                "following": profile.get("following", 0),
+                "private": bool(profile.get("is_private")),
+                "cache_hit": bool(profile.get("cache_hit")),
+            }
+        except GatewayError as exc:
+            report["profile"] = self._probe_error(exc)
+            return report
+
+        if profile.get("is_private"):
+            return report
+
+        for kind in ("followers", "following"):
+            try:
+                page = await self.list_page(handle, kind, "")
+                report[kind] = {
+                    "ok": True,
+                    "items": len(page.get("items") or []),
+                    "has_next": bool(page.get("next_cursor")),
+                    "cache_hit": bool(page.get("cache_hit")),
+                }
+            except GatewayError as exc:
+                report[kind] = self._probe_error(exc)
+                if exc.status in (401, 403, 429):
+                    break
+        return report
+
+    def cache_status(self, handle: str) -> dict[str, Any]:
+        return self.store.status(handle)
+
+    async def _request_json(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        referer: str,
+        context: str,
+    ) -> dict[str, Any]:
+        self._ensure_available()
+        assert self.client is not None
+        self._assert_anonymous_session()
+        await self._pace()
+
+        try:
+            response = await self.client.get(url, params=params, headers={"Referer": referer})
+        except httpx.TimeoutException as exc:
+            self.last_error = f"public web {context} request timed out"
+            raise GatewayError(
+                "public_timeout",
+                "Instagram's public web response timed out. No retry was attempted.",
+                504,
+            ) from exc
+        except httpx.HTTPError as exc:
+            self.last_error = f"public web {context} network error: {type(exc).__name__}"
+            raise GatewayError(
+                "public_network_error",
+                "Instagram's public web endpoint could not be reached.",
+                502,
+            ) from exc
+        finally:
+            self.last_request_at = time.monotonic()
+
+        if response.status_code == 404:
+            if context == "profile":
+                raise GatewayError("user_not_found", "Instagram account not found.", 404)
+            raise GatewayError(
+                "public_relationship_unavailable",
+                "Instagram's public relationship endpoint is not available for this request.",
+                503,
+            )
+
+        if response.status_code in (401, 403, 429):
+            retry_after = self._retry_after(response)
+            self.blocked_until = max(self.blocked_until, time.time() + retry_after)
+            self.last_error = f"Instagram public web returned HTTP {response.status_code}"
+            code = "instagram_rate_limited" if response.status_code == 429 else "public_access_blocked"
+            message = (
+                "Instagram rate-limited anonymous public-web requests. FollowCheck stopped and entered cooldown."
+                if response.status_code == 429
+                else "Instagram blocked anonymous access to this public-web request. FollowCheck stopped without retrying."
+            )
+            raise GatewayError(code, message, response.status_code, retry_after)
+
+        if response.status_code >= 500:
+            self.last_error = f"Instagram public web returned HTTP {response.status_code}"
+            raise GatewayError(
+                "instagram_unavailable",
+                "Instagram's public web service is temporarily unavailable.",
+                502,
+            )
+
+        if response.status_code >= 400:
+            self.last_error = f"Instagram public web returned HTTP {response.status_code}"
+            raise GatewayError(
+                "public_surface_unavailable",
+                "Instagram did not accept this anonymous public-web request.",
+                503,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self.last_error = f"Instagram public web returned non-JSON for {context}"
+            raise GatewayError(
+                "public_response_invalid",
+                "Instagram returned an unexpected public-web response.",
+                502,
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise GatewayError(
+                "public_response_invalid",
+                "Instagram returned an unexpected public-web response.",
+                502,
+            )
+        self.last_error = ""
+        return payload
+
+    def _assert_anonymous_session(self) -> None:
+        if self.client is None:
+            return
+        auth_names = {"sessionid", "ds_user_id"}
+        present = {cookie.name.lower() for cookie in self.client.cookies.jar}
+        if present & auth_names:
+            self.ready = False
+            self.last_error = "authenticated Instagram cookie detected in anonymous gateway"
+            raise GatewayError(
+                "anonymous_session_contaminated",
+                "FollowCheck refused to send an authenticated Instagram cookie from anonymous public-web mode.",
+                503,
+            )
+
+    async def _pace(self) -> None:
+        if self.min_interval <= 0 or self.last_request_at <= 0:
+            return
+        wait = self.min_interval - (time.monotonic() - self.last_request_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+    def _ensure_available(self) -> None:
+        retry_after = max(0, int(self.blocked_until - time.time()))
+        if retry_after > 0:
+            raise GatewayError(
+                "instagram_cooldown",
+                "Instagram public-web access is cooling down. FollowCheck will not send more requests until the cooldown ends.",
+                429,
+                retry_after,
+            )
+        if not self.ready or self.client is None:
+            raise GatewayError(
+                "public_gateway_not_ready",
+                self.last_error or "Public web gateway is not ready.",
+                503,
+            )
+
+    def _retry_after(self, response: httpx.Response) -> int:
+        raw = response.headers.get("Retry-After", "").strip()
+        try:
+            header_seconds = int(raw)
+        except (TypeError, ValueError):
+            header_seconds = 0
+        return max(self.cooldown_seconds, header_seconds, 60)
+
+    @staticmethod
+    def _count(user: dict[str, Any], kind: ListKind) -> int:
+        if kind == "followers":
+            direct = user.get("follower_count")
+            nested = user.get("edge_followed_by")
+        else:
+            direct = user.get("following_count")
+            nested = user.get("edge_follow")
+        if direct is not None:
+            try:
+                return max(0, int(direct))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(nested, dict):
+            try:
+                return max(0, int(nested.get("count") or 0))
+            except (TypeError, ValueError):
+                pass
+        return 0
+
+    @staticmethod
+    def _clean_node(node: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": str(node.get("id") or node.get("pk") or ""),
+            "username": str(node.get("username") or ""),
+            "full_name": str(node.get("full_name") or ""),
+            "is_verified": bool(node.get("is_verified")),
+            "is_private": bool(node.get("is_private")),
+            "profile_pic_url": str(node.get("profile_pic_url") or ""),
+        }
+
+    @staticmethod
+    def _probe_error(exc: GatewayError) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "status": exc.status,
+            "message": str(exc),
+            "retry_after": exc.retry_after,
+        }

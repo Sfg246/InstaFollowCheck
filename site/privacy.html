@@ -11,12 +11,13 @@
   <header class="site-header"><a class="brand" href="./"><span class="brand-mark">F</span><span>FollowCheck</span></a></header>
   <main class="shell prose">
     <h1>Privacy</h1>
-    <p><strong>FollowCheck never asks visitors for their Instagram password.</strong></p>
-    <p>When you scan a public username, that username is sent to the FollowCheck backend. The backend uses the site owner's dedicated Instagram collector session to request the public profile, followers, and following data required for the comparison.</p>
-    <p>The collector account credentials and saved session stay on the private backend server. They are never shipped to the website or browser.</p>
-    <p>The comparison and selection interface run in your browser. FollowCheck stores lightweight preferences on your device, including the optional site access code and usernames you mark as handled.</p>
-    <p>The default backend uses short-lived in-memory caching to reduce repeated Instagram requests and does not include a follower database. Normal server/reverse-proxy logs may still contain request metadata such as IP address and timestamps.</p>
-    <p>Private Instagram targets are intentionally refused. FollowCheck is not affiliated with Instagram or Meta.</p>
+    <p><strong>FollowCheck never asks visitors for their Instagram password or session cookie.</strong></p>
+    <p>When you scan a public username, that username is sent to the FollowCheck backend. The v3 backend makes anonymous requests to Instagram public-web surfaces. It is not configured with an Instagram account, password, sessionid, or paid data-provider API key.</p>
+    <p>The backend keeps a shared persistent cache of public profile and relationship pages so repeated scans can reuse recently fetched data. Cached relationship data may include Instagram numeric user IDs, usernames, display names, public/private flags, verification flags, and profile image URLs returned by the public-web response.</p>
+    <p>The comparison and selection interface run in your browser. FollowCheck stores lightweight preferences on your device, including the optional site access code, cooldown/ETA state, and usernames you mark as handled.</p>
+    <p>Normal server, tunnel, or reverse-proxy logs may contain request metadata such as IP address and timestamps. The app does not automate follows or unfollows.</p>
+    <p>Private Instagram targets are intentionally refused. Instagram may change, restrict, or rate-limit public-web access at any time. FollowCheck stops on access blocks or rate limits rather than trying to bypass them.</p>
+    <p>FollowCheck is not affiliated with Instagram or Meta.</p>
     <p><a href="./">← Back to FollowCheck</a></p>
   </main>
 </body>

@@ -7,9 +7,9 @@ services:
     env_file:
       - ./server/.env
     volumes:
-      - followcheck-instagram-session:/data
+      - followcheck-data:/data
     ports:
       - "127.0.0.1:8787:8787"
 
 volumes:
-  followcheck-instagram-session:
+  followcheck-data:

@@ -36,11 +36,11 @@
       </form>
 
       <div class="trust-grid">
-        <div><strong>No password</strong><span>We never ask for your Instagram login.</span></div>
-        <div><strong>Public accounts</strong><span>Username-only scans use public relationship data.</span></div>
-        <div><strong>Fast cleanup</strong><span>Select accounts and step through an unfollow queue.</span></div>
+        <div><strong>No password</strong><span>No visitor Instagram login is requested.</span></div>
+        <div><strong>Public accounts</strong><span>Scans use anonymous public-web data only.</span></div>
+        <div><strong>Completeness check</strong><span>FollowCheck stops instead of showing a partial comparison.</span></div>
       </div>
-      <p class="fine-print">FollowCheck is not affiliated with Instagram or Meta. Public account data is requested through the configured data provider.</p>
+      <p class="fine-print">FollowCheck is not affiliated with Instagram or Meta. Public-web access can change or be rate-limited by Instagram.</p>
     </section>
 
     <section id="results" class="results" hidden>
@@ -122,6 +122,7 @@
 
   <script src="./config.js"></script>
   <script src="./assets/cooldown.js"></script>
+  <script src="./assets/integrity.js"></script>
   <script src="./assets/analysis-eta.js"></script>
   <script type="module" src="./assets/app.js"></script>
 </body>
