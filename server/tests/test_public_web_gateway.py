@@ -143,10 +143,11 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             paths.append(request.url.path)
-            if request.url.path == "/web/search/topsearch/":
-                self.assertNotIn("x-ig-app-id", request.headers)
+            if request.url.path == "/api/v1/web/search/topsearch/":
+                self.assertEqual(request.headers.get("x-ig-app-id"), gateway.app_id)
                 query = parse_qs(request.url.query.decode())
                 self.assertEqual(query["query"][0], "publicperson")
+                self.assertEqual(query["include_reel"][0], "false")
                 return httpx.Response(200, json=topsearch_payload())
             return httpx.Response(500)
 
@@ -165,7 +166,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report["profile_strategies"]["topsearch"]["ok"])
         self.assertEqual(report["profile_strategies"]["profile_html"]["status"], "not_run")
         self.assertEqual(report["profile_strategies"]["web_profile_info"]["status"], "not_run")
-        self.assertEqual(paths, ["/web/search/topsearch/"])
+        self.assertEqual(paths, ["/api/v1/web/search/topsearch/"])
         await gateway.close()
 
     async def test_topsearch_requires_exact_username(self) -> None:
@@ -188,7 +189,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
             calls.append(request.url.path)
             if request.url.path == "/publicperson/":
                 return httpx.Response(200, text="<html><body>shell only</body></html>")
-            if request.url.path == "/web/search/topsearch/":
+            if request.url.path == "/api/v1/web/search/topsearch/":
                 return httpx.Response(200, json=topsearch_payload())
             return httpx.Response(500)
 
@@ -199,7 +200,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
         result = await gateway.profile("publicperson")
         self.assertEqual(result["id"], "100")
         self.assertEqual(result["source"], "topsearch")
-        self.assertEqual(calls, ["/publicperson/", "/web/search/topsearch/"])
+        self.assertEqual(calls, ["/publicperson/", "/api/v1/web/search/topsearch/"])
         await gateway.close()
 
     async def test_auto_profile_can_reach_web_info_after_two_unusable_200s(self) -> None:
@@ -209,7 +210,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
             calls.append(request.url.path)
             if request.url.path == "/publicperson/":
                 return httpx.Response(200, text="<html><body>shell only</body></html>")
-            if request.url.path == "/web/search/topsearch/":
+            if request.url.path == "/api/v1/web/search/topsearch/":
                 return httpx.Response(200, json={"users": [], "status": "ok"})
             if request.url.path.endswith("/web_profile_info/"):
                 return httpx.Response(
@@ -236,7 +237,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["source"], "web_profile_info")
         self.assertEqual(
             calls,
-            ["/publicperson/", "/web/search/topsearch/", "/api/v1/users/web_profile_info/"],
+            ["/publicperson/", "/api/v1/web/search/topsearch/", "/api/v1/users/web_profile_info/"],
         )
         await gateway.close()
 
@@ -269,7 +270,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             paths.append(request.url.path)
-            if request.url.path == "/web/search/topsearch/":
+            if request.url.path == "/api/v1/web/search/topsearch/":
                 return httpx.Response(200, json=topsearch_payload())
             if request.url.path.endswith("/graphql/query/"):
                 query = parse_qs(request.url.query.decode())
@@ -307,7 +308,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["followers"]["total_count"], 12)
         self.assertTrue(report["following"]["ok"])
         self.assertEqual(report["following"]["total_count"], 7)
-        self.assertEqual(paths, ["/web/search/topsearch/", "/graphql/query/", "/graphql/query/"])
+        self.assertEqual(paths, ["/api/v1/web/search/topsearch/", "/graphql/query/", "/graphql/query/"])
         await gateway.close()
 
     async def test_probe_stops_after_relationship_access_block(self) -> None:
@@ -315,7 +316,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             paths.append(request.url.path)
-            if request.url.path == "/web/search/topsearch/":
+            if request.url.path == "/api/v1/web/search/topsearch/":
                 return httpx.Response(200, json=topsearch_payload())
             if request.url.path.endswith("/graphql/query/"):
                 return httpx.Response(403, json={"message": "blocked"})
@@ -330,7 +331,7 @@ class PublicWebGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(report["followers"]["ok"])
         self.assertEqual(report["followers"]["status"], 403)
         self.assertEqual(report["following"]["status"], "not_run")
-        self.assertEqual(paths, ["/web/search/topsearch/", "/graphql/query/"])
+        self.assertEqual(paths, ["/api/v1/web/search/topsearch/", "/graphql/query/"])
         await gateway.close()
 
     async def test_html_parser_handles_nested_json_string(self) -> None:
