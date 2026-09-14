@@ -21,7 +21,7 @@ ListKind = Literal["followers", "following"]
 ProfileStrategy = Literal["profile_html", "topsearch", "web_profile_info"]
 
 PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
-TOPSEARCH_URL = "https://www.instagram.com/web/search/topsearch/"
+TOPSEARCH_URL = "https://www.instagram.com/api/v1/web/search/topsearch/"
 GRAPHQL_URL = "https://www.instagram.com/graphql/query/"
 DEFAULT_APP_ID = "936619743392459"
 DEFAULT_FOLLOWERS_HASH = "c76146de99bb02f6415203be841dd25a"
@@ -187,10 +187,10 @@ class PublicWebGateway:
 
             payload = await self._request_json(
                 TOPSEARCH_URL,
-                params={"context": "blended", "include_reel": "true", "query": handle},
+                params={"context": "blended", "include_reel": "false", "query": handle},
                 referer="https://www.instagram.com/",
                 context="profile_topsearch",
-                include_app_id=False,
+                include_app_id=True,
             )
             raw_user = self._exact_topsearch_user(payload, handle)
             if raw_user is None:
