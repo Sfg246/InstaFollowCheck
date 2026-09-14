@@ -54,7 +54,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="FollowCheck Public-Web API",
-    version="3.1.0",
+    version="3.2.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -81,7 +81,7 @@ class ListRequest(BaseModel):
 
 class ProbeRequest(BaseModel):
     handle: str
-    profile_strategy: Literal["profile_html", "web_profile_info"] = "profile_html"
+    profile_strategy: Literal["profile_html", "topsearch", "web_profile_info"] = "profile_html"
     include_relationships: bool = True
 
 

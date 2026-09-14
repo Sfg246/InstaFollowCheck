@@ -18,9 +18,10 @@ from .graph_store import GraphStore
 log = logging.getLogger("followcheck.public_web")
 
 ListKind = Literal["followers", "following"]
-ProfileStrategy = Literal["profile_html", "web_profile_info"]
+ProfileStrategy = Literal["profile_html", "topsearch", "web_profile_info"]
 
 PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+TOPSEARCH_URL = "https://www.instagram.com/web/search/topsearch/"
 GRAPHQL_URL = "https://www.instagram.com/graphql/query/"
 DEFAULT_APP_ID = "936619743392459"
 DEFAULT_FOLLOWERS_HASH = "c76146de99bb02f6415203be841dd25a"
@@ -30,16 +31,15 @@ SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.IGNORECASE | re.D
 
 
 class PublicWebGateway:
-    """Read Instagram surfaces that are reachable without authentication.
+    """Read Instagram surfaces reachable without authenticating an account.
 
     Safety properties:
     - never accepts or sends an Instagram username/password/sessionid;
-    - no proxy rotation, fingerprint rotation, account rotation, or anti-bot bypass;
-    - all Instagram requests are serialized and paced;
-    - a 401/403/429 stops origin traffic and starts a cooldown;
+    - no proxy, account, device, fingerprint, or cookie rotation;
+    - origin requests are serialized and paced;
+    - 401/403/429 stops origin traffic and starts a cooldown;
     - zero automatic HTTP retries;
-    - capability probes choose one profile strategy explicitly, so strategies can
-      be tested independently instead of chaining requests after a block.
+    - probes choose exactly one profile-discovery strategy.
     """
 
     def __init__(self) -> None:
@@ -96,18 +96,16 @@ class PublicWebGateway:
             "ready": bool(self.ready and self.client is not None and retry_after == 0),
             "mode": "public_web",
             "authenticated": False,
-            "profile_strategies": ["profile_html", "web_profile_info"],
+            "profile_strategies": ["profile_html", "topsearch", "web_profile_info"],
             "cooldown_seconds": retry_after,
             "last_error": self.last_error or None,
         }
 
     async def profile(self, handle: str) -> dict[str, Any]:
-        """Resolve a public profile with cache + conservative strategy fallback.
+        """Resolve a profile with conservative anonymous strategy fallback.
 
-        The ordinary app path prefers the normal logged-out profile HTML. It only
-        falls back to web_profile_info when HTML returned successfully but did not
-        contain enough parseable public profile data. Access blocks never trigger
-        a second origin request.
+        Fallback only occurs after a successful HTTP response that simply lacked a
+        usable exact profile. A 401/403/429 never causes another strategy request.
         """
         cached = self.store.get_profile(handle)
         if cached is not None:
@@ -117,6 +115,12 @@ class PublicWebGateway:
             return await self._profile_html(handle, use_cache=False)
         except GatewayError as exc:
             if exc.code != "public_profile_html_unusable":
+                raise
+
+        try:
+            return await self._profile_topsearch(handle, use_cache=False)
+        except GatewayError as exc:
+            if exc.code != "public_topsearch_unusable":
                 raise
 
         return await self._profile_web_info(handle, use_cache=False)
@@ -130,6 +134,8 @@ class PublicWebGateway:
     ) -> dict[str, Any]:
         if strategy == "profile_html":
             return await self._profile_html(handle, use_cache=use_cache)
+        if strategy == "topsearch":
+            return await self._profile_topsearch(handle, use_cache=use_cache)
         if strategy == "web_profile_info":
             return await self._profile_web_info(handle, use_cache=use_cache)
         raise GatewayError("invalid_probe_strategy", "Unknown profile probe strategy.", 400)
@@ -163,7 +169,39 @@ class PublicWebGateway:
                 )
 
             result = self._profile_result(raw_user, handle, source="profile_html")
-            self.store.set_profile(handle, {k: v for k, v in result.items() if k != "cache_hit"})
+            self._cache_profile(handle, result)
+            return result
+
+    async def _profile_topsearch(self, handle: str, *, use_cache: bool) -> dict[str, Any]:
+        """Resolve an exact username from Instagram's logged-out web search surface."""
+        if use_cache:
+            cached = self.store.get_profile(handle)
+            if cached is not None:
+                return {**cached, "cache_hit": True}
+
+        async with self.lock:
+            if use_cache:
+                cached = self.store.get_profile(handle)
+                if cached is not None:
+                    return {**cached, "cache_hit": True}
+
+            payload = await self._request_json(
+                TOPSEARCH_URL,
+                params={"context": "blended", "include_reel": "true", "query": handle},
+                referer="https://www.instagram.com/",
+                context="profile_topsearch",
+                include_app_id=False,
+            )
+            raw_user = self._exact_topsearch_user(payload, handle)
+            if raw_user is None:
+                raise GatewayError(
+                    "public_topsearch_unusable",
+                    "Instagram's logged-out web search response did not contain an exact usable username match.",
+                    503,
+                )
+
+            result = self._profile_result(raw_user, handle, source="topsearch")
+            self._cache_profile(handle, result)
             return result
 
     async def _profile_web_info(self, handle: str, *, use_cache: bool) -> dict[str, Any]:
@@ -183,6 +221,7 @@ class PublicWebGateway:
                 params={"username": handle},
                 referer=f"https://www.instagram.com/{quote(handle)}/",
                 context="profile_web_info",
+                include_app_id=True,
             )
             raw_user = payload.get("data", {}).get("user") if isinstance(payload, dict) else None
             if not isinstance(raw_user, dict):
@@ -192,16 +231,37 @@ class PublicWebGateway:
                     502,
                 )
             result = self._profile_result(raw_user, handle, source="web_profile_info")
-            self.store.set_profile(handle, {k: v for k, v in result.items() if k != "cache_hit"})
+            self._cache_profile(handle, result)
             return result
+
+    def _cache_profile(self, handle: str, result: dict[str, Any]) -> None:
+        self.store.set_profile(handle, {k: v for k, v in result.items() if k != "cache_hit"})
+
+    @staticmethod
+    def _exact_topsearch_user(payload: dict[str, Any], handle: str) -> dict[str, Any] | None:
+        users = payload.get("users") if isinstance(payload, dict) else None
+        if not isinstance(users, list):
+            return None
+        target = handle.lower()
+        for entry in users:
+            if not isinstance(entry, dict):
+                continue
+            user = entry.get("user")
+            if not isinstance(user, dict):
+                continue
+            username = str(user.get("username") or "").strip()
+            user_id = str(user.get("pk") or user.get("id") or user.get("user_id") or "").strip()
+            if username.lower() == target and user_id.isdigit():
+                return user
+        return None
 
     def _profile_result(self, raw_user: dict[str, Any], handle: str, *, source: str) -> dict[str, Any]:
         user_id = str(raw_user.get("id") or raw_user.get("pk") or raw_user.get("user_id") or "")
         username = str(raw_user.get("username") or handle)
-        if not user_id:
+        if not user_id or not user_id.isdigit():
             raise GatewayError(
                 "public_profile_unavailable",
-                "Instagram's public profile response did not include a usable user id.",
+                "Instagram's public profile response did not include a usable numeric user id.",
                 502,
             )
         return {
@@ -254,7 +314,7 @@ class PublicWebGateway:
                 )
 
             user_id = str(profile.get("id") or "")
-            if not user_id:
+            if not user_id or not user_id.isdigit():
                 raise GatewayError("user_not_found", "Instagram account not found.", 404)
 
             variables: dict[str, Any] = {
@@ -282,6 +342,7 @@ class PublicWebGateway:
                 },
                 referer=f"https://www.instagram.com/{quote(handle)}/",
                 context=kind,
+                include_app_id=True,
             )
 
             edge_name = "edge_followed_by" if kind == "followers" else "edge_follow"
@@ -297,7 +358,7 @@ class PublicWebGateway:
             raw_edges = edge.get("edges")
             if not isinstance(raw_edges, list):
                 raw_edges = []
-            items = []
+            items: list[dict[str, Any]] = []
             for raw_edge in raw_edges:
                 node = raw_edge.get("node") if isinstance(raw_edge, dict) else None
                 if not isinstance(node, dict):
@@ -316,10 +377,17 @@ class PublicWebGateway:
                     502,
                 )
 
-            expected_count = int(profile.get("followers" if kind == "followers" else "following") or 0)
+            profile_count = int(profile.get("followers" if kind == "followers" else "following") or 0)
+            try:
+                edge_count = max(0, int(edge.get("count") or 0))
+            except (TypeError, ValueError):
+                edge_count = 0
+            expected_count = edge_count or profile_count
+
             result = {
                 "items": items,
                 "next_cursor": next_cursor or None,
+                "total_count": expected_count,
                 "source": "instagram_public_web_graphql",
                 "cache_hit": False,
             }
@@ -331,6 +399,13 @@ class PublicWebGateway:
                 payload={k: v for k, v in result.items() if k != "cache_hit"},
                 expected_count=expected_count,
             )
+
+            field = "followers" if kind == "followers" else "following"
+            if edge_count > 0 and int(profile.get(field) or 0) <= 0:
+                updated_profile = dict(profile)
+                updated_profile[field] = edge_count
+                self.store.set_profile(handle, updated_profile)
+
             return result
 
     async def probe(
@@ -340,24 +415,16 @@ class PublicWebGateway:
         *,
         include_relationships: bool = True,
     ) -> dict[str, Any]:
-        """Probe one selected profile strategy and, if it works, first relationship pages.
-
-        No strategy fallback happens inside a probe. This is deliberate: a failure
-        of one profile surface does not cause requests to another surface, and a
-        401/403/429 never triggers additional Instagram-origin traffic.
-        """
+        """Probe one selected profile strategy plus at most one page per relationship."""
+        strategies: tuple[ProfileStrategy, ...] = ("profile_html", "topsearch", "web_profile_info")
         report: dict[str, Any] = {
             "handle": handle,
             "mode": "public_web",
             "authenticated": False,
             "selected_profile_strategy": profile_strategy,
             "profile_strategies": {
-                "profile_html": {"selected": profile_strategy == "profile_html", "ok": False, "status": "not_run"},
-                "web_profile_info": {
-                    "selected": profile_strategy == "web_profile_info",
-                    "ok": False,
-                    "status": "not_run",
-                },
+                name: {"selected": profile_strategy == name, "ok": False, "status": "not_run"}
+                for name in strategies
             },
             "profile": {"ok": False},
             "followers": {"ok": False, "status": "not_run"},
@@ -377,17 +444,11 @@ class PublicWebGateway:
                 "cache_hit": bool(profile.get("cache_hit")),
             }
             report["profile"] = profile_report
-            report["profile_strategies"][profile_strategy] = {
-                "selected": True,
-                **profile_report,
-            }
+            report["profile_strategies"][profile_strategy] = {"selected": True, **profile_report}
         except GatewayError as exc:
             error = self._probe_error(exc)
             report["profile"] = error
-            report["profile_strategies"][profile_strategy] = {
-                "selected": True,
-                **error,
-            }
+            report["profile_strategies"][profile_strategy] = {"selected": True, **error}
             return report
 
         if profile.get("is_private") or not include_relationships:
@@ -403,6 +464,7 @@ class PublicWebGateway:
                     "ok": True,
                     "status": 200,
                     "items": len(page.get("items") or []),
+                    "total_count": int(page.get("total_count") or 0),
                     "has_next": bool(page.get("next_cursor")),
                     "cache_hit": bool(page.get("cache_hit")),
                     "source": page.get("source"),
@@ -423,6 +485,7 @@ class PublicWebGateway:
         params: dict[str, Any],
         referer: str,
         context: str,
+        include_app_id: bool = True,
     ) -> dict[str, Any]:
         response = await self._request_response(
             url,
@@ -430,7 +493,7 @@ class PublicWebGateway:
             referer=referer,
             context=context,
             accept="application/json,text/plain,*/*",
-            include_app_id=True,
+            include_app_id=include_app_id,
         )
         try:
             payload = response.json()
@@ -496,11 +559,7 @@ class PublicWebGateway:
             request_headers = {"Referer": referer, "Accept": accept}
             if include_app_id:
                 request_headers["X-IG-App-ID"] = self.app_id
-            response = await self.client.get(
-                url,
-                params=params,
-                headers=request_headers,
-            )
+            response = await self.client.get(url, params=params, headers=request_headers)
         except httpx.TimeoutException as exc:
             self.last_error = f"public web {context} request timed out"
             raise GatewayError(
@@ -612,13 +671,6 @@ class PublicWebGateway:
         return max(self.cooldown_seconds, header_seconds, 60)
 
     def _extract_profile_from_html(self, text: str, handle: str) -> dict[str, Any] | None:
-        """Extract a matching user object from public HTML/embedded JSON.
-
-        Instagram changes the envelope around its server-rendered data frequently,
-        so this searches JSON script payloads recursively rather than depending on
-        one JavaScript variable name. A raw-text fallback requires an exact
-        username plus a nearby numeric id.
-        """
         target = handle.lower()
         best: tuple[int, dict[str, Any]] | None = None
 
