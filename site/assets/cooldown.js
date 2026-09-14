@@ -5,6 +5,10 @@
   let cooldownUntil = Number(localStorage.getItem(STORAGE_KEY) || 0);
   let intervalId = null;
 
+  function apiBase() {
+    return String(window.FOLLOWCHECK_CONFIG?.apiBaseUrl || '').replace(/\/$/, '');
+  }
+
   function formatRemaining(totalSeconds) {
     const seconds = Math.max(0, Math.ceil(totalSeconds));
     const minutes = Math.floor(seconds / 60);
@@ -73,6 +77,19 @@
     setTimeout(renderCooldown, 50);
   }
 
+  async function syncFromHealth() {
+    const base = apiBase();
+    if (!base) return;
+
+    try {
+      const response = await originalFetch(`${base}/health`, { cache: 'no-store' });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const remaining = Number(payload?.cooldown_seconds || 0);
+      if (remaining > 0) beginCooldown(remaining);
+    } catch (_) {}
+  }
+
   window.fetch = async (...args) => {
     const response = await originalFetch(...args);
 
@@ -85,6 +102,7 @@
       } catch (_) {}
 
       if (retryAfter > 0) beginCooldown(retryAfter);
+      else setTimeout(syncFromHealth, 0);
     }
 
     return response;
@@ -99,6 +117,10 @@
       cooldownUntil = 0;
       localStorage.removeItem(STORAGE_KEY);
     }
+
+    // Ask the backend for the authoritative remaining cooldown. This also lets
+    // a refreshed/new browser show the timer while a cooldown is already active.
+    syncFromHealth();
   }
 
   if (document.readyState === 'loading') {
